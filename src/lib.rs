@@ -31,6 +31,8 @@ use std::fmt;
 
 pub mod bot;
 pub mod bots;
+pub mod mcts;
+
 
 use crate::bot::{BotInterface, Context, OtherBot};
 
