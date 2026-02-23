@@ -1,96 +1,83 @@
-// this is our basic MCTS engine
-// currently using rollout evaluation
-// not full UCT tree expansion yet (skeleton is here though)
-
 use rand::prelude::*;
+
 use super::sim_state::SimState;
 use crate::Action;
 
-#[derive(Clone)]
-struct Node {
-    state: SimState,
-    visits: u32,
-    value: f32,
-    children: Vec<Node>,
-    action: Option<Action>,
-}
-
-impl Node {
-    fn new(state: SimState) -> Self {
-        Self {
-            state,
-            visits: 0,
-            value: 0.0,
-            children: vec![],
-            action: None,
-        }
-    }
-}
+use crate::bots::duel_brain::DuelBrain;
 
 pub struct Mcts {
-    root: Node,
+    root: SimState,
 }
 
 impl Mcts {
     pub fn new(state: SimState) -> Self {
-        Self {
-            root: Node::new(state),
-        }
+        Self { root: state }
     }
-    // run multiple simulations to estimate action quality
-    // each iteration performs a random rollout
-    pub fn search(&mut self, iterations: usize) {
-        let mut rng = thread_rng();
 
-        for _ in 0..iterations {
-            let reward = self.rollout(self.root.state.clone(), &mut rng);
-            self.root.visits += 1;
-            self.root.value += reward;
+    pub fn search(&self, iterations: usize) -> Option<Action> {
+        let mut rng = thread_rng();
+        let actions = self.root.legal_actions_for(self.root.to_move);
+        if actions.is_empty() {
+            return None;
         }
-    }
-    // simulate random future actions until depth limit
-    // this prevents infinite loops since our sim is incomplete
-    fn rollout(&self, mut state: SimState, rng: &mut ThreadRng) -> f32 {
-        for _ in 0..20 {   // limit depth to 20 steps
-            if state.is_terminal() {
-                return state.reward();
-            }
-    
-            let actions = state.legal_actions();
-            if actions.is_empty() {
-                return 0.0;
-            }
-    
-            let action = actions[rng.gen_range(0..actions.len())].clone();
-            state = state.apply_action(&action);
-        }
-    
-        0.0 // return neutral if depth limit reached
-    }
-    // choose the action that performed best in simulations
-    // rn very simple evaluation logic
-    pub fn best_action(&self) -> Option<Action> {
-        let actions = self.root.state.legal_actions();
-    
-        let mut best_score = f32::MIN;
+
         let mut best_action = None;
-    
-        let mut rng = rand::thread_rng();
-    
+        let mut best_score = f32::MIN;
+
         for action in actions {
             let mut total = 0.0;
-    
-            for _ in 0..50 {
-                let next_state = self.root.state.apply_action(&action);
-                total += self.rollout(next_state.clone(), &mut rng);
+            for _ in 0..iterations {
+                total += self.rollout_with_policy(&action, &mut rng);
             }
-    
             if total > best_score {
                 best_score = total;
                 best_action = Some(action);
             }
         }
-    
+
         best_action
+    }
+
+    fn rollout_with_policy(&self, first_action: &Action, rng: &mut ThreadRng) -> f32 {
+        // Per-rollout brains (no shared memory contamination)
+        let mut brains: Vec<DuelBrain> = (0..self.root.players.len()).map(|_| DuelBrain::new()).collect();
+
+        let mut s = self.root.clone();
+
+        // apply the candidate first action for root
+        s.step(first_action, rng);
+
+        // simulate forward
+        let max_depth = 30;
+        for _ in 0..max_depth {
+            if s.is_terminal() {
+                return s.reward_for_root();
+            }
+
+            // if current player dead, step() will advance; but we still keep loop simple
+            let pi = s.to_move;
+            if s.players[pi].cards.is_empty() {
+                s.to_move = (s.to_move + 1) % s.players.len();
+                continue;
+            }
+
+            let ctx = s.as_context_for_player(pi);
+
+            // DuelBrain proposes an action; clamp to legal to avoid unsupported outputs
+            let proposed = brains[pi].decide_turn(&ctx);
+            let legal = s.legal_actions_for(pi);
+
+            let chosen = if legal.iter().any(|a| a == &proposed) {
+                proposed
+            } else {
+                // fallback: pick a random legal action
+                legal[rng.gen_range(0..legal.len())].clone()
+            };
+
+            s.step(&chosen, rng);
+        }
+
+        // depth cutoff
+        s.reward_for_root()
     }
 }

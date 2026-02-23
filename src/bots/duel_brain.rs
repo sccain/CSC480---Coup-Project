@@ -250,6 +250,76 @@ impl DuelBrain {
         true
     }
 
+    fn should_bluff_block_steal(&self, context: &Context, by: &str) -> bool {
+        // If all copies are visible, don't bluff a block that cannot exist.
+        let can_claim_captain = Self::remaining_copies(context, Card::Captain) > 0;
+        let can_claim_ambassador = Self::remaining_copies(context, Card::Ambassador) > 0;
+        if !can_claim_captain && !can_claim_ambassador {
+            return false;
+        }
+
+        // Find the stealing player (duels: should exist)
+        let opp = context.playing_bots.iter().find(|b| b.name == by);
+
+        // If we can't find them (weird state), default to bluff-blocking (safe for duels).
+        let Some(opp) = opp else {
+            return true;
+        };
+
+        // If they have already demonstrated stealing, treat it as a big threat:
+        // In your model, opponent Stealing claims increment Captain claim count.
+        let steal_claims = self.opp_claims(Card::Captain);
+
+        // If we're behind on coins or they can reach coup tempo soon, block more.
+        let coin_gap = (opp.coins as i32) - (context.coins as i32);
+
+        // Estimate how likely they are to challenge *our* block claim.
+        // We'll choose the "safer" claim (Captain vs Ambassador) to bluff.
+        let p_chal_cap = if can_claim_captain {
+            self.p_opponent_challenges_claim(context, Card::Captain, 1.05)
+        } else {
+            1.0
+        };
+        let p_chal_amb = if can_claim_ambassador {
+            self.p_opponent_challenges_claim(context, Card::Ambassador, 1.05)
+        } else {
+            1.0
+        };
+
+        let best_p_chal = p_chal_cap.min(p_chal_amb);
+
+        // Aggressive policy:
+        // - If opponent is already stealing (or ahead), bluff-block unless challenge is extremely likely.
+        // - Otherwise still bluff-block fairly often (because repeated steals snowball hard in duels).
+        if steal_claims >= 1 || coin_gap >= 1 || opp.coins >= 5 {
+            best_p_chal < 0.70
+        } else {
+            best_p_chal < 0.55
+        }
+    }
+
+    /// Decide whether to counter/block an opponent action.
+    /// Return `true` to counter, `false` otherwise.
+    ///
+    /// Currently we focus on blocking Stealing aggressively (Captain/Ambassador).
+    pub fn decide_counter(&mut self, action: &Action, by: &str, context: &Context) -> bool {
+        self.update_from_history(context);
+
+        match action {
+            Action::Stealing(target) if target == &context.name => {
+                // Truthful block: always block if we actually can.
+                if context.cards.contains(&Card::Captain) || context.cards.contains(&Card::Ambassador)
+                {
+                    return true;
+                }
+
+                // Otherwise bluff-block more frequently to prevent steal snowballing.
+                self.should_bluff_block_steal(context, by)
+            }
+            _ => false,
+        }
+    }
+
     /// Main “duel policy” action selection (same as DuelBot’s on_turn).
     pub fn decide_turn(&mut self, context: &Context) -> Action {
         self.update_from_history(context);
