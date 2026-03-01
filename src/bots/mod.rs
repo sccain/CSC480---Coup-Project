@@ -6,9 +6,11 @@ pub mod static_bot;
 //pub mod duel_bot;
 pub mod mcts_bot;
 pub mod duel_brain;
+pub mod human;
 
 pub use honest_bot::HonestBot;
 pub use random_bot::RandomBot;
 pub use static_bot::StaticBot;
 //pub use duel_bot::DuelBot;
 pub use mcts_bot::MctsBot;
+pub use human::Human;

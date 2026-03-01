@@ -250,6 +250,143 @@ impl DuelBrain {
         true
     }
 
+    fn should_bluff_block_steal(&self, context: &Context, by: &str) -> bool {
+        // If all copies are visible, don't bluff a block that cannot exist.
+        let can_claim_captain = Self::remaining_copies(context, Card::Captain) > 0;
+        let can_claim_ambassador = Self::remaining_copies(context, Card::Ambassador) > 0;
+        if !can_claim_captain && !can_claim_ambassador {
+            return false;
+        }
+
+        // Find the stealing player (duels: should exist)
+        let opp = context.playing_bots.iter().find(|b| b.name == by);
+
+        // If we can't find them (weird state), default to bluff-blocking (safe for duels).
+        let Some(opp) = opp else {
+            return true;
+        };
+
+        // If they have already demonstrated stealing, treat it as a big threat:
+        // In your model, opponent Stealing claims increment Captain claim count.
+        let steal_claims = self.opp_claims(Card::Captain);
+
+        // If we're behind on coins or they can reach coup tempo soon, block more.
+        let coin_gap = (opp.coins as i32) - (context.coins as i32);
+
+        // Estimate how likely they are to challenge *our* block claim.
+        // We'll choose the "safer" claim (Captain vs Ambassador) to bluff.
+        let p_chal_cap = if can_claim_captain {
+            self.p_opponent_challenges_claim(context, Card::Captain, 1.05)
+        } else {
+            1.0
+        };
+        let p_chal_amb = if can_claim_ambassador {
+            self.p_opponent_challenges_claim(context, Card::Ambassador, 1.05)
+        } else {
+            1.0
+        };
+
+        let best_p_chal = p_chal_cap.min(p_chal_amb);
+
+        // Aggressive policy:
+        // - If opponent is already stealing (or ahead), bluff-block unless challenge is extremely likely.
+        // - Otherwise still bluff-block fairly often (because repeated steals snowball hard in duels).
+        if steal_claims >= 1 || coin_gap >= 1 || opp.coins >= 5 {
+            best_p_chal < 0.70
+        } else {
+            best_p_chal < 0.55
+        }
+    }
+
+    fn should_bluff_block_assassination(&self, context: &Context, by: &str) -> bool {
+        // Only Contessa can block assassination.
+        // If all Contessas are visible, don't bluff a block that cannot exist.
+        let can_claim_contessa = Self::remaining_copies(context, Card::Contessa) > 0;
+        if !can_claim_contessa {
+            return false;
+        }
+
+        // Find the acting player (duels: should exist)
+        let opp = context.playing_bots.iter().find(|b| b.name == by);
+
+        // If we can't find them (weird state), default to bluff-blocking.
+        // (Same reasoning as your steal function: in a duel this "shouldn't happen".)
+        let Some(opp) = opp else {
+            return true;
+        };
+
+        // Threat / tempo heuristics:
+        // - Assassination is huge in duels (often worth bluff-blocking, especially at 1 influence).
+        // - If we are on our last influence, we should block unless they're *very* likely to challenge.
+        let one_influence_left = context.cards.len() <= 1;
+
+        // If they are rich, they can keep pressuring; blocks buy time.
+        // (Assassination costs 3, so having >= 3 means the threat is "live".)
+        let opp_can_assassinate_again_soon = opp.coins >= 3;
+
+        // If they are close to coup tempo, preserving influence matters a lot.
+        let opp_near_coup = opp.coins >= 6;
+
+        // Optional: if your model records assassination behavior as Assassin claims,
+        // you can use it to treat them as "more credible" (so we bluff-block slightly less).
+        // If you don't track this, just remove these two lines and keep credible_assassin = false.
+        let assassin_claims = self.opp_claims(Card::Assassin);
+        let credible_assassin = assassin_claims >= 1;
+
+        // Estimate how likely they are to challenge our Contessa claim.
+        // Use the same calibration factor you used for steal (1.05) unless you have a reason to change it.
+        let p_chal = self.p_opponent_challenges_claim(context, Card::Contessa, 1.05);
+
+        // Policy:
+        // - If we're at 1 influence: bluff-block unless challenge is extremely likely.
+        // - If they are near coup / can keep assassinating: still block fairly aggressively.
+        // - If they look credible as Assassin: require lower challenge probability (they're more likely to call you).
+        if one_influence_left {
+            // Desperation mode: block even if likely to be challenged, but not when it's basically guaranteed.
+            p_chal < 0.85
+        } else if opp_near_coup || opp_can_assassinate_again_soon {
+            if credible_assassin {
+                p_chal < 0.60
+            } else {
+                p_chal < 0.70
+            }
+        } else {
+            // If they're not pressuring much, only bluff-block when we expect relatively low challenge probability.
+            if credible_assassin {
+                p_chal < 0.50
+            } else {
+                p_chal < 0.55
+            }
+        }
+    }
+
+    /// Decide whether to counter/block an opponent action.
+    /// Return `true` to counter, `false` otherwise.
+    ///
+    /// Currently we focus on blocking Stealing aggressively (Captain/Ambassador).
+    pub fn decide_counter(&mut self, action: &Action, by: &str, context: &Context) -> bool {
+        self.update_from_history(context);
+
+        match action {
+            Action::Stealing(target) if target == &context.name => {
+                if context.cards.contains(&Card::Captain) || context.cards.contains(&Card::Ambassador)
+                {
+                    return true;
+                }
+                self.should_bluff_block_steal(context, by)
+            }
+
+            Action::Assassination(target) if target == &context.name => {
+                if context.cards.contains(&Card::Contessa) {
+                    return true;
+                }
+                self.should_bluff_block_assassination(context, by)
+            }
+
+            _ => false,
+        }
+    }
+
     /// Main “duel policy” action selection (same as DuelBot’s on_turn).
     pub fn decide_turn(&mut self, context: &Context) -> Action {
         self.update_from_history(context);

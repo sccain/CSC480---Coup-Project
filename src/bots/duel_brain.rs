@@ -298,6 +298,54 @@ impl DuelBrain {
         }
     }
 
+    fn should_bluff_block_assassination(&self, context: &Context, by: &str) -> bool {
+        // Only Contessa can block assassination.
+        // If all copies are visible, don't bluff a block that cannot exist.
+        let can_claim_contessa = Self::remaining_copies(context, Card::Contessa) > 0;
+        if !can_claim_contessa {
+            return false;
+        }
+
+        // Find the assassinating player (duels: should exist)
+        let opp = context.playing_bots.iter().find(|b| b.name == by);
+
+        // If we can't find them (weird state), default to bluff-blocking (safe for duels).
+        let Some(opp) = opp else {
+            return true;
+        };
+
+        // Desperation mode: on last influence, blocking is extremely valuable.
+        let one_influence_left = context.cards.len() <= 1;
+
+        // If they can keep applying pressure (assassinate again or coup soon), blocks buy time.
+        let opp_can_assassinate_again_soon = opp.coins >= 3;
+        let opp_near_coup = opp.coins >= 6;
+
+        // If they have already demonstrated assassination, assume they're more likely to challenge our Contessa bluff.
+        let assassin_claims = self.opp_claims(Card::Assassin);
+        let credible_assassin = assassin_claims >= 1;
+
+        // Estimate how likely they are to challenge *our* Contessa claim.
+        let p_chal = self.p_opponent_challenges_claim(context, Card::Contessa, 1.25);
+
+        if one_influence_left {
+            // Block unless challenge is basically guaranteed.
+            p_chal < 0.85
+        } else if opp_near_coup || opp_can_assassinate_again_soon {
+            if credible_assassin {
+                p_chal < 0.60
+            } else {
+                p_chal < 0.70
+            }
+        } else {
+            if credible_assassin {
+                p_chal < 0.50
+            } else {
+                p_chal < 0.55
+            }
+        }
+    }
+
     /// Decide whether to counter/block an opponent action.
     /// Return `true` to counter, `false` otherwise.
     ///
@@ -316,8 +364,107 @@ impl DuelBrain {
                 // Otherwise bluff-block more frequently to prevent steal snowballing.
                 self.should_bluff_block_steal(context, by)
             }
+            Action::Assassination(target) if target == &context.name => {
+                // Truthful block: always block if we actually have Contessa.
+                if context.cards.contains(&Card::Contessa) {
+                    return true;
+                }
+
+                // Otherwise sometimes bluff-block to prevent getting picked off.
+                self.should_bluff_block_assassination(context, by)
+            }
             _ => false,
         }
+    }
+
+    /// Decide whether to challenge an opponent's action claim.
+    /// Return `true` to challenge, `false` otherwise.
+    pub fn decide_challenge_action(&mut self, action: &Action, by: &str, context: &Context) -> bool {
+        self.update_from_history(context);
+
+        // Find the acting player (duels: should exist)
+        let actor = context.playing_bots.iter().find(|b| b.name == by);
+        let Some(actor) = actor else {
+            return false;
+        };
+
+        // Map actions to their required roles (challengeable claims).
+        // (Only challenge actions that actually require a card.)
+        let (role, reward_delta, stake) = match action {
+            Action::Tax => (Card::Duke, 1.0, 1.05),
+            Action::Swapping => (Card::Ambassador, 0.8, 1.00),
+            Action::Stealing(target) if target == &context.name => (Card::Captain, 1.6, 1.15),
+            Action::Assassination(target) if target == &context.name => (Card::Assassin, 3.0, 1.45),
+            Action::Stealing(_) => (Card::Captain, 0.9, 1.00),
+            Action::Assassination(_) => (Card::Assassin, 1.4, 1.15),
+            _ => return false,
+        };
+
+        // If the claimed role cannot exist, always challenge.
+        if Self::remaining_copies(context, role) == 0 {
+            return true;
+        }
+
+        // Estimated probability they actually have the role.
+        let p_has = self.p_opponent_has(context, actor.cards as i32, role);
+        let p_bluff = 1.0 - p_has;
+
+        // Risk of being wrong: losing influence.
+        let risk_loss = if context.cards.len() <= 1 { 2.0 } else { 1.0 };
+
+        // Expected value of challenging.
+        let ev = p_bluff * reward_delta - (1.0 - p_bluff) * risk_loss;
+
+        // stake increases aggressiveness slightly
+        ev > 0.9
+    }
+
+    /// Decide whether to challenge an opponent's counter-claim.
+    /// Return `true` to challenge, `false` otherwise.
+    pub fn decide_challenge_counter(&mut self, action: &Action, by: &str, context: &Context) -> bool {
+        self.update_from_history(context);
+
+        // Find the countering player (duels: should exist)
+        let blocker = context.playing_bots.iter().find(|b| b.name == by);
+        let Some(blocker) = blocker else {
+            return false;
+        };
+
+        // Determine what role they must be claiming to block this action.
+        // (Engine passes the original action into on_challenge_counter_round.)
+        let (role_a, role_b, reward_delta, stake) = match action {
+            Action::ForeignAid => (Some(Card::Duke), None, 1.2, 1.05),
+            Action::Stealing(_) => (Some(Card::Captain), Some(Card::Ambassador), 1.5, 1.10),
+            Action::Assassination(_) => (Some(Card::Contessa), None, 2.2, 1.30),
+            _ => return false,
+        };
+
+        // If neither possible role can exist, always challenge.
+        let role_a_ok = role_a.map(|r| Self::remaining_copies(context, r) > 0).unwrap_or(false);
+        let role_b_ok = role_b.map(|r| Self::remaining_copies(context, r) > 0).unwrap_or(false);
+        if !role_a_ok && !role_b_ok {
+            return true;
+        }
+
+        // Estimate probability they have a valid blocking role; choose the most plausible.
+        let mut p_has_block: f64 = 0.0;
+        if let Some(r) = role_a {
+            if Self::remaining_copies(context, r) > 0 {
+                p_has_block = p_has_block.max(self.p_opponent_has(context, blocker.cards as i32, r));
+            }
+        }
+        if let Some(r) = role_b {
+            if Self::remaining_copies(context, r) > 0 {
+                p_has_block = p_has_block.max(self.p_opponent_has(context, blocker.cards as i32, r));
+            }
+        }
+
+        let p_bluff = 1.0 - p_has_block;
+
+        let risk_loss = if context.cards.len() <= 1 { 2.0 } else { 1.0 };
+        let ev = p_bluff * reward_delta - (1.0 - p_bluff) * risk_loss;
+
+        ev > 0.9
     }
 
     /// Main “duel policy” action selection (same as DuelBot’s on_turn).

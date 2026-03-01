@@ -25,8 +25,6 @@ impl BotInterface for MctsBot {
     }
 
     fn on_turn(&self, context: &Context) -> Action {
-        println!("MCTSBot deciding...");
-
         let mut rng = rand::thread_rng();
         let sim = SimState::from_context_with_sampled_opponents(context, &mut rng);
 
@@ -41,5 +39,17 @@ impl BotInterface for MctsBot {
 
     fn on_counter(&self, action: &Action, by: String, context: &Context) -> bool {
         self.brain.borrow_mut().decide_counter(action, &by, context)
+    }
+
+    fn on_challenge_action_round(&self, action: &Action, by: String, context: &Context) -> bool {
+        self.brain
+            .borrow_mut()
+            .decide_challenge_action(action, &by, context)
+    }
+
+    fn on_challenge_counter_round(&self, action: &Action, by: String, context: &Context) -> bool {
+        self.brain
+            .borrow_mut()
+            .decide_challenge_counter(action, &by, context)
     }
 }
