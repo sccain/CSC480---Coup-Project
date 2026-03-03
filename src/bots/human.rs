@@ -28,19 +28,28 @@ impl BotInterface for Human {
 		String::from("Human")
 	}
 
-	/// Acts on cards it has and falls back to [Action::Income].
-	/// Never plays [Action::ForeignAid] or [Action::Swapping].
-	fn on_turn(&self, context: &Context) -> Action {
-        for card in context.cards.clone(){
+    fn on_turn(&self, context: &Context) -> Action {
+        print!("\n");
+
+        for card in context.cards.clone() {
             println!("{:#?}", card);
         }
-        println!("\n");
+        print!("\n");
         println!("(Type 'h' for role reference)");
-        
-        let mut action = 0;
-        while true{
+
+        // decide the maximum action number available based on coins
+        let max_action = if context.coins >= 7 {
+            7
+        } else if context.coins >= 3 {
+            6
+        } else {
+            5
+        };
+
+        let action_num: i32 = loop {
             let mut input = String::new();
-            println!("\nSelect an action:\n");
+
+            println!("\nSelect an action:");
             println!("1. Income: Collect 1 coin");
             println!("2. Foreign Aid: Collect 2 coins");
             println!("3. Tax: Collect 3 coins as Duke");
@@ -48,88 +57,108 @@ impl BotInterface for Human {
             println!("5. Exchange: Replace cards as Ambassador");
 
             if context.coins >= 3 {
-                println!("6. Assassinate: Pay 3 coins to assasinate another player as Assasin");
+                println!("6. Assassinate: Pay 3 coins to assassinate another player as Assassin");
             }
             if context.coins >= 7 {
                 println!("7. Coup: Pay 7 coins to launch a Coup on another player");
             }
+
             print!("> ");
             io::stdout().flush().unwrap();
-            
-            io::stdin()
-                .read_line(&mut input)
-                .expect("Failed to read line");
-            
-                let trimmed = input.trim();
 
-                if trimmed.eq_ignore_ascii_case("h") {
-                    print_role_reference();
+            if io::stdin().read_line(&mut input).is_err() {
+                println!("Failed to read input. Try again.");
+                continue;
+            }
+            let trimmed = input.trim();
+
+            if trimmed.eq_ignore_ascii_case("h") {
+                print_role_reference();
+                continue;
+            }
+
+            match trimmed.parse::<i32>() {
+                Ok(n) if (1..=max_action).contains(&n) => break n,
+                _ => {
+                    println!(
+                        "Invalid selection. Enter a number between 1 and {} (you have {} coins).",
+                        max_action, context.coins
+                    );
                     continue;
                 }
-                
-                let num: i32 = match trimmed.parse() {
-                    Ok(n) => n,
-                    Err(_) => {
-                        println!("Please enter a valid number.");
-                        continue;
-                    }
-                };
-
-            if num >= 1 && num <= 5 {
-                action = num;
-                break;
-            } else if num >= 1 && num <= 6 && context.coins >= 3 {
-                action = num;
-                break;
-            } else if num >= 1 && num <= 7 && context.coins >= 7 {
-                action = num;
-                break;
             }
-            
-            println!("Invalid selection or insufficient coins");
+        };
+
+        // map chosen number to Action variants that don't require targets
+        match action_num {
+            1 => return Action::Income,
+            2 => return Action::ForeignAid,
+            3 => return Action::Tax,
+            5 => return Action::Swapping,
+            _ => {} // fallthrough to actions that require a target (4,6,7)
         }
 
-        if action == 1 {
-            Action::Income
-        } else if action == 2 {
-            Action::ForeignAid
-        } else if action == 3 {
-            Action::Tax
-        } else if action == 5 {
-            Action::Swapping
-        } else  {
-            let mut target = String::new();
-            loop {
-                println!("Select a target: ");
-                let mut idx = 0;
-                for bot in context.playing_bots.iter() {
-                    idx = idx + 1;
-                    println!("{}: {}", idx, bot.name);
-                }
-                print!("> ");
-                io::stdin()
-                    .read_line(&mut target)
-                    .expect("Failed to read line");
+        // Must pick a target for actions 4, 6, 7.
+        // Build list of candidates (exclude self if present)
+        let candidates: Vec<_> = context
+            .playing_bots
+            .iter()
+            .filter(|b| b.name != self.get_name())
+            .collect();
 
-                if context.playing_bots.iter().filter(|bot| bot.name == target).count() == 1 {
-                    break;
-                } else {
-                    println!("Invalid bot");
-                }
+        if candidates.is_empty() {
+            // fallback: if there are no other players, treat as income
+            println!("No other players to target — defaulting to Income.");
+            return Action::Income;
+        }
+
+        let target_name: String = loop {
+            println!("\nSelect a target:");
+            for (i, bot) in candidates.iter().enumerate() {
+                println!("{}: {}", i + 1, bot.name);
+            }
+            print!("> ");
+            io::stdout().flush().unwrap();
+
+            let mut input = String::new();
+            if io::stdin().read_line(&mut input).is_err() {
+                println!("Failed to read input. Try again.");
+                continue;
+            }
+            let trimmed = input.trim();
+            if trimmed.is_empty() {
+                println!("Please enter an index.");
+                continue;
             }
 
-            if action == 4 {
-                Action::Stealing(target)
-            } else if action == 6 {
-                Action::Assassination(target)
-            } else {
-                Action::Coup(target)
+            // parse as 1-based index into candidates
+            match trimmed.parse::<usize>() {
+                Ok(n) if n >= 1 && n <= candidates.len() => {
+                    break candidates[n - 1].name.clone();
+                }
+                _ => {
+                    println!(
+                        "Invalid index. Enter a number between 1 and {}.",
+                        candidates.len()
+                    );
+                    continue;
+                }
+            }
+        };
+
+        // return the targetting action
+        match action_num {
+            4 => Action::Stealing(target_name),
+            6 => Action::Assassination(target_name),
+            7 => Action::Coup(target_name),
+            _ => {
+                // shouldn't happen because we validated action_num earlier
+                Action::Income
             }
         }
-	}
+    }
 
 	fn on_auto_coup(&self, context: &Context) -> String {
-		let mut target = String::new();
         loop {
             println!("Select a Coup target: ");
             let mut idx = 0;
@@ -138,17 +167,21 @@ impl BotInterface for Human {
                 println!("{}: {}", idx, bot.name);
             }
             print!("> ");
+            io::stdout().flush().unwrap();
+            let mut input = String::new();
             io::stdin()
-                .read_line(&mut target)
+                .read_line(&mut input)
                 .expect("Failed to read line");
 
-            if context.playing_bots.iter().filter(|bot| bot.name == target).count() == 1 {
-                break;
-            } else {
-                println!("Invalid bot");
+            if let Ok(n) = input.parse::<usize>() {
+                if n >= 1 && n <= context.playing_bots.len() {
+                    return context.playing_bots[n - 1].name.clone();
+                } else {
+                    println!("Index out of range (1..={}).", context.playing_bots.len());
+                    continue;
+                }
             }
         }
-        target
 	}
 
 	fn on_challenge_action_round(
@@ -160,10 +193,10 @@ impl BotInterface for Human {
 		let mut choice = 0;
         loop {
             let mut input = String::new();
-            println!("Challenge?
-                    \n 0: No
-                    \n 1: Yes");
-            print!("> ");;
+            println!("Challenge?\n0: No\n1: Yes");
+            print!("> ");
+
+            io::stdout().flush().unwrap();
             
             io::stdin()
                 .read_line(&mut input)
@@ -199,10 +232,10 @@ impl BotInterface for Human {
 		let mut choice = 0;
         loop {
             let mut input = String::new();
-            println!("Counter?
-                    \n 0: No
-                    \n 1: Yes");
+            println!("Counter?\n0: No\n1: Yes");
             print!("> ");
+
+            io::stdout().flush().unwrap();
             
             io::stdin()
                 .read_line(&mut input)
@@ -238,10 +271,10 @@ impl BotInterface for Human {
 		let mut choice = 0;
         loop {
             let mut input = String::new();
-            println!("Challenge Counter?
-                    \n 0: No
-                    \n 1: Yes");
+            println!("Challenge counter?\n0: No\n1: Yes");
             print!("> ");
+
+            io::stdout().flush().unwrap();
             
             io::stdin()
                 .read_line(&mut input)
@@ -327,38 +360,34 @@ impl BotInterface for Human {
     }
 
 
-	/// Takes the first card to discard
-	fn on_card_loss(&self, context: &Context) -> Card {
-		for card in context.cards.clone(){
-            println!("{:#?}", card);
+
+    fn on_card_loss(&self, context: &Context) -> Card {
+        let cards = context.cards.clone();
+
+        for (i, card) in cards.iter().enumerate() {
+            println!("{}: {:#?}", i + 1, card);
         }
 
-        let mut choice = 0;
         loop {
+            println!("Choose a card to lose:");
+            print!("> ");
+            io::stdout().flush().unwrap(); // Ensure prompt prints
+
             let mut input = String::new();
-            println!("Challenge?
-                    \n 0: No
-                    \n 1: Yes");
-                print!("> ");
-            
             io::stdin()
                 .read_line(&mut input)
                 .expect("Failed to read line");
-            
-            let num: i32 = input
-                .trim() // Remove whitespace
-                .parse() // Convert to i32
-                .expect("Please enter a valid number");
 
-            if num == 0 {
-                choice = num;
-                break;
-            } else if num == 1 {
-                choice = num;
-                break;
-            }   
-        } 
-        
-        context.cards.clone().pop().unwrap()
-	}
+            if let Ok(num) = input.trim().parse::<usize>() {
+                // Ensure valid 1-based input
+                if num >= 1 && num <= cards.len() {
+                    return cards[num - 1].clone(); // Adjust for 0-based index
+                }
+            }
+
+            println!("Invalid selection, try again.");
+        }
+    }
+
+
 }
