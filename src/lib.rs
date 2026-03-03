@@ -213,6 +213,8 @@ pub struct Coup {
 	total_bluffs: HashMap<String, u32>,
 	caught_bluffs: HashMap<String, u32>,
 	successful_bluffs: HashMap<String, u32>,
+	successful_challenges: HashMap<String, u32>,
+	failed_challenges: HashMap<String, u32>
 }
 
 impl Coup {
@@ -262,6 +264,8 @@ impl Coup {
 			total_bluffs: HashMap::new(),
 			caught_bluffs: HashMap::new(),
 			successful_bluffs: HashMap::new(),
+			successful_challenges: HashMap::new(),
+			failed_challenges: HashMap::new()
 		}
 	}
 
@@ -479,34 +483,6 @@ impl Coup {
 	}
 
 
-fn summarize_bluffs(&self) {
-    let mut bluffs: HashMap<String, (u32, u32, u32)> = HashMap::new();
-    // (total_bluffs, caught_bluffs, successful_bluffs)
-
-    for event in &self.all_history {
-        match event {
-            History::Bluff { player, card,success } => {
-                let entry = bluffs.entry(player.clone()).or_insert((0,0,0));
-                entry.0 += 1; // total bluffs
-                if *success {
-                    entry.2 += 1; // successful
-                } else {
-                    entry.1 += 1; // caught
-                }
-            }
-            _ => {}
-        }
-    }
-
-    println!("\n📊 Bluff Statistics Across All Games\n");
-    for (player, (total, caught, successful)) in &bluffs {
-        println!("🤖 {}", player);
-        println!("   Total Bluffs: {}", total);
-        println!("   Caught Bluffs: {}", caught);
-        println!("   Successful Bluffs: {}", successful);
-        println!();
-    }
-}
 
 	/// Playing a game which means we setup the table, give each bots their cards
 	/// and coins and start the game loop.
@@ -541,7 +517,22 @@ fn summarize_bluffs(&self) {
 
     // Let's play
     while self.playing_bots.len() > 1 {
-        self.game_loop();
+        
+		println!("\n🃏 Current Card State:");
+		for bot in &self.bots {
+			println!("   🤖 {} -> {:?}", bot.name, bot.cards);
+
+			 println!("🤖 {}", bot.name);
+				println!("   Total Bluffs: {}", self.total_bluffs.get(&bot.name).unwrap_or(&0));
+				println!("   Caught Bluffs: {}", self.caught_bluffs.get(&bot.name).unwrap_or(&0));
+				println!("   Successful Bluffs: {}", self.successful_bluffs.get(&bot.name).unwrap_or(&0));
+		}
+		println!(); 
+
+		
+		
+		self.game_loop();
+
 
         if self.moves >= 1000 {
             break;
@@ -568,7 +559,7 @@ fn summarize_bluffs(&self) {
     );
 
     // --- NEW: Print challenge summary ---
-    Self::log(format_args!("\n📜 Challenge Summary:\n"), self.log);
+   println!("\n📜 Final Challenge Summary:\n");
     for event in &self.history {
         match event {
             History::ChallengeResult { challenger, challenged, card,success } => {
@@ -601,23 +592,23 @@ fn summarize_bluffs(&self) {
         }
     }
 
-		println!("\n📊 Bluff Statistics\n");
+	
 
 	for bot in &self.bots {
-    let total_bluffs = self.all_history.iter()
-        .filter(|h| matches!(h, History::Bluff { player, .. } if player == &bot.name))
-        .count();
+		let name = &bot.name;
+		println!("🤖 {}", name);
+		println!("   Successful Challenges: {}", self.successful_challenges.get(name).unwrap_or(&0));
+		println!("   Failed Challenges: {}", self.failed_challenges.get(name).unwrap_or(&0));
+}
 
-    let caught_bluffs = self.all_history.iter()
-        .filter(|h| matches!(h, History::Bluff { player, success: false, .. } if player == &bot.name))
-        .count();
+		println!("\n📊 Bluff Statistics\n");
 
-    let successful_bluffs = self.all_history.iter()
-        .filter(|h| matches!(h, History::Bluff { player, success: true, .. } if player == &bot.name))
-        .count();
-
-    println!("🤖 {}\n   Total Bluffs: {}\n   Caught Bluffs: {}\n   Successful Bluffs: {}\n",
-        bot.name, total_bluffs, caught_bluffs, successful_bluffs);
+for bot in &self.bots {
+    let name = &bot.name;
+    println!("🤖 {}", name);
+    println!("   Total Bluffs: {}", self.total_bluffs.get(name).unwrap_or(&0));
+    println!("   Caught Bluffs: {}", self.caught_bluffs.get(name).unwrap_or(&0));
+    println!("   Successful Bluffs: {}", self.successful_bluffs.get(name).unwrap_or(&0));
 }
 	// Append per-game history to all_history
 	self.all_history.extend(self.history.drain(..));
@@ -771,6 +762,8 @@ fn summarize_bluffs(&self) {
 			},
 		}
 
+		
+
 		// Let's filter out all dead bots
 		self.playing_bots = self
 			.playing_bots
@@ -811,13 +804,6 @@ fn summarize_bluffs(&self) {
 ) {
     let playing_bot_name = self.bots[self.playing_bots[self.turn]].name.clone();
 
-    // Track total bluff attempt if the action can be challenged
-    match action {
-        Action::Assassination(_) | Action::Stealing(_) | Action::Swapping | Action::Tax => {
-            *self.total_bluffs.entry(playing_bot_name.clone()).or_insert(0) += 1;
-        }
-        _ => {}
-    }
 
     // ===== Challenge Round =====
     if let Some(challenger) = self.challenge_round(
@@ -832,8 +818,6 @@ fn summarize_bluffs(&self) {
         );
 
         if !success {
-            // Challenge failed → player successfully bluffed
-            *self.successful_bluffs.entry(playing_bot_name.clone()).or_insert(0) += 1;
 
             let discard_card = match action {
                 Action::Assassination(_) => Card::Assassin,
@@ -916,29 +900,7 @@ fn summarize_bluffs(&self) {
 		// THE CHALLENGE ROUND
 		let playing_bot_name = self.bots[self.playing_bots[self.turn]].name.clone();
 
-		let acting_bot = self.get_bot_by_name(playing_bot_name.clone());
 
-		match action {
-			Action::Tax => {
-				let has_duke = acting_bot.cards.iter().any(|c| *c == Card::Duke);
-				if !has_duke {
-					*self.total_bluffs
-						.entry(playing_bot_name.clone())
-						.or_insert(0) += 1;
-				}
-			}
-
-			Action::Swapping => {
-				let has_ambassador = acting_bot.cards.iter().any(|c| *c == Card::Ambassador);
-				if !has_ambassador {
-					*self.total_bluffs
-						.entry(playing_bot_name.clone())
-						.or_insert(0) += 1;
-				}
-			}
-
-			_ => {}
-		}
 		// On Action::Swapping and Action::Tax
 		// Does anyone want to challenge this action?
 		if let Some(challenger) = self.challenge_round(
@@ -1139,8 +1101,8 @@ fn summarize_bluffs(&self) {
     // Determine challenge outcome
     let success = if player_has_card {
         // Challenge failed → bluff successful
-        *self.successful_bluffs.entry(p_name.clone()).or_insert(0) += 1;
-
+		*self.failed_challenges.entry(c_name.clone()).or_insert(0) += 1;
+        
         Self::log(
             format_args!(
                 "👎  The challenge was unsuccessful because {} did have the {:?}",
@@ -1153,6 +1115,7 @@ fn summarize_bluffs(&self) {
     } else {
         // Challenge succeeded → bluff caught
         *self.caught_bluffs.entry(p_name.clone()).or_insert(0) += 1;
+		*self.successful_challenges.entry(c_name.clone()).or_insert(0) += 1;
 
         Self::log(
             format_args!(
@@ -1164,6 +1127,12 @@ fn summarize_bluffs(&self) {
         self.card_loss(p_name.clone());
         true
     };
+
+
+	// If it was a bluff AND challenge failed → successful bluff
+	if !player_has_card && !success {
+		*self.successful_bluffs.entry(p_name.clone()).or_insert(0) += 1;
+	}
 
     // Push ChallengeResult
     self.history.push(History::ChallengeResult {
@@ -1212,9 +1181,9 @@ fn summarize_bluffs(&self) {
     });
 
     let success = if counterer_has_card {
-        // Challenge failed → counterer successfully bluffed
-        *self.successful_bluffs.entry(c_name.clone()).or_insert(0) += 1;
 
+		*self.failed_challenges.entry(ch_name.clone()).or_insert(0) += 1;
+		
         Self::log(
             format_args!(
                 "👎  The counter was unsuccessful because {} did have the {}",
@@ -1228,6 +1197,8 @@ fn summarize_bluffs(&self) {
     } else {
         // Challenge succeeded → counterer caught bluff
         *self.caught_bluffs.entry(c_name.clone()).or_insert(0) += 1;
+		*self.successful_challenges.entry(ch_name.clone()).or_insert(0) += 1;
+
 
         Self::log(
             format_args!(
@@ -1240,6 +1211,12 @@ fn summarize_bluffs(&self) {
         self.card_loss(c_name.clone());
         true
     };
+
+
+	// Count successful bluff (lied AND survived)
+	if !counterer_has_card && !success {
+		*self.successful_bluffs.entry(c_name.clone()).or_insert(0) += 1;
+	}
 
     success
 }
@@ -1351,11 +1328,34 @@ fn summarize_bluffs(&self) {
 		);
 
 
+println!("\n📜 Final Challenge Summary Across All Games:\n");
 
+let mut challenge_summary: HashMap<String, (u32, u32)> = HashMap::new();
+// (successful, failed) challenges
 
-	println!("\n📊 Bluff Statistics\n");
+for event in &self.all_history {
+    match event {
+        History::ChallengeResult { challenger, challenged: _, card: _, success } => {
+            let entry = challenge_summary.entry(challenger.clone()).or_insert((0, 0));
+            if *success { entry.0 += 1; } else { entry.1 += 1; }
+        }
+        History::CounterChallengeResult { challenger, counterer: _, cards: _, success } => {
+            let entry = challenge_summary.entry(challenger.clone()).or_insert((0, 0));
+            if *success { entry.0 += 1; } else { entry.1 += 1; }
+        }
+        _ => {}
+    }
+}
 
+// Print nicely
+for (player, (successes, failures)) in &challenge_summary {
+    println!(
+        "🤖 {} \n   Successful Challenges: {} \n   Failed Challenges: {}",
+        player, successes, failures
+    );
+}
 
+println!("\n📊 Final Bluff Statistics Across All Games:\n");
 
 for bot in &self.bots {
     let name = &bot.name;

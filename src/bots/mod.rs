@@ -3,6 +3,7 @@
 pub mod honest_bot;
 pub mod random_bot;
 pub mod static_bot;
+pub mod duel_bot;
 //pub mod duel_bot;
 pub mod mcts_bot;
 pub mod duel_brain;
@@ -14,3 +15,4 @@ pub use static_bot::StaticBot;
 //pub use duel_bot::DuelBot;
 pub use mcts_bot::MctsBot;
 pub use human::Human;
+pub use duel_bot::DuelBot;
