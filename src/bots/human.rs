@@ -1,9 +1,23 @@
 //! An honest bot implementation for you to use to test your own bot with.
-use std::io;
+use std::io::{self, Write};
 use crate::{
 	bot::{BotInterface, Context},
 	Action, Card,
 };
+
+
+/// Prints a compact reference of all roles
+fn print_role_reference() {
+    println!("\n");
+    println!("Role Reference");
+    println!("Duke       → Tax (3 coins), blocks Foreign Aid");
+    println!("Assassin   → Assassinate (pay 3 coins)");
+    println!("Captain    → Steal (2 coins), blocks Steal");
+    println!("Ambassador → Exchange cards, blocks Steal");
+    println!("Contessa   → Blocks Assassination");
+    println!("\n");
+
+}
 
 /// The human should be able to decide what happens on each turn
 pub struct Human;
@@ -20,16 +34,18 @@ impl BotInterface for Human {
         for card in context.cards.clone(){
             println!("{:#?}", card);
         }
-    
+        println!("\n");
+        println!("(Type 'h' for role reference)");
+        
         let mut action = 0;
         while true{
             let mut input = String::new();
-            println!("Select an action: 
-                    \n1. Income: Collect 1 coin
-                    \n2. Foreign Aid: Collect 2 coins
-                    \n3. Tax: Collect 3 coins as Duke
-                    \n4. Steal: Take coins from another player as Captain
-                    \n5. Exchange: Replace cards as Ambassador");
+            println!("\nSelect an action:\n");
+            println!("1. Income: Collect 1 coin");
+            println!("2. Foreign Aid: Collect 2 coins");
+            println!("3. Tax: Collect 3 coins as Duke");
+            println!("4. Steal: Take coins from another player as Captain");
+            println!("5. Exchange: Replace cards as Ambassador");
 
             if context.coins >= 3 {
                 println!("6. Assassinate: Pay 3 coins to assasinate another player as Assasin");
@@ -38,15 +54,26 @@ impl BotInterface for Human {
                 println!("7. Coup: Pay 7 coins to launch a Coup on another player");
             }
             print!("> ");
+            io::stdout().flush().unwrap();
             
             io::stdin()
                 .read_line(&mut input)
                 .expect("Failed to read line");
             
-            let num: i32 = input
-                .trim() // Remove whitespace
-                .parse() // Convert to i32
-                .expect("Please enter a valid number");
+                let trimmed = input.trim();
+
+                if trimmed.eq_ignore_ascii_case("h") {
+                    print_role_reference();
+                    continue;
+                }
+                
+                let num: i32 = match trimmed.parse() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        println!("Please enter a valid number.");
+                        continue;
+                    }
+                };
 
             if num >= 1 && num <= 5 {
                 action = num;
@@ -136,7 +163,7 @@ impl BotInterface for Human {
             println!("Challenge?
                     \n 0: No
                     \n 1: Yes");
-            print!("> ");
+            print!("> ");;
             
             io::stdin()
                 .read_line(&mut input)
@@ -242,22 +269,62 @@ impl BotInterface for Human {
 
      /// INCOMPLETE \/\/\/\/
 
-	/// Swaps duplicate cards
-	fn on_swapping_cards(
-		&self,
-		new_cards: [Card; 2],
-		context: &Context,
-	) -> [Card; 2] {
-		let mut discard_cards = Vec::new();
-		if context.cards[0] == context.cards[1] {
-			discard_cards.push(context.cards[0])
-		} else {
-			discard_cards.push(new_cards[0]);
-		}
-		discard_cards.push(new_cards[1]);
+     /// changed it 
 
-		[discard_cards[0], discard_cards[1]]
-	}
+	/// Swaps duplicate cards
+    fn on_swapping_cards(
+        &self,
+        new_cards: [Card; 2],
+        context: &Context,
+    ) -> [Card; 2] {
+    
+        println!("\nYou are swapping cards.");
+        println!("Choose 2 cards to keep.\n");
+    
+        // Combine old + new cards
+        let mut options = Vec::new();
+        options.extend_from_slice(&context.cards);
+        options.extend_from_slice(&new_cards);
+    
+        // Display options
+        for (i, card) in options.iter().enumerate() {
+            println!("{}. {:?}", i + 1, card);
+        }
+    
+        // Choose first card
+        let first_choice = loop {
+            let mut input = String::new();
+            print!("Select first card to keep: ");
+            std::io::stdout().flush().unwrap();
+            std::io::stdin().read_line(&mut input).unwrap();
+    
+            if let Ok(num) = input.trim().parse::<usize>() {
+                if num >= 1 && num <= options.len() {
+                    break num - 1;
+                }
+            }
+    
+            println!("Invalid selection.");
+        };
+    
+        // Choose second card
+        let second_choice = loop {
+            let mut input = String::new();
+            print!("Select second card to keep: ");
+            std::io::stdout().flush().unwrap();
+            std::io::stdin().read_line(&mut input).unwrap();
+    
+            if let Ok(num) = input.trim().parse::<usize>() {
+                if num >= 1 && num <= options.len() && (num - 1) != first_choice {
+                    break num - 1;
+                }
+            }
+    
+            println!("Invalid selection.");
+        };
+    
+        [options[first_choice], options[second_choice]]
+    }
 
 
 	/// Takes the first card to discard
@@ -272,7 +339,7 @@ impl BotInterface for Human {
             println!("Challenge?
                     \n 0: No
                     \n 1: Yes");
-            print!("> ");
+                print!("> ");
             
             io::stdin()
                 .read_line(&mut input)
