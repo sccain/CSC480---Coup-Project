@@ -33,7 +33,7 @@ impl BotInterface for MctsBot {
         // iterations here are per candidate action; tune this
         let action = mcts.search(200).unwrap_or(Action::Income);
 
-        println!("MCTSBot chose: {:?}", action);
+        //println!("MCTSBot chose: {:?}", action);
         action
     }
 
