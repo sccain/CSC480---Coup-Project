@@ -10,16 +10,17 @@ use coup::{
 fn main() {
     let mut coup_game = Coup::new(vec![
 
-        //Box::new(MctsBot::default()),
+        Box::new(MctsBot::default()),
         Box::new(HonestBot),
         //Box::new(DuelBot),
-        Box::new(Human),
-        //çBox::new(HonestBot)
+        //Box::new(Human),
+        //Box::new(HonestBot)
+        Box::new(RandomBot)
     ]); 
 
     // Play a single game
-    coup_game.play();
+    //coup_game.play();
 
     // Or play multiple games
-    //coup_game.looping(2);
+    coup_game.looping(100);
 }

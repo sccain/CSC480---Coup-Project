@@ -165,6 +165,14 @@ struct Bot {
 	interface: Box<dyn BotInterface>,
 }
 
+struct MultipleGameStats {
+    total_bluffs: HashMap<String, u32>,
+    caught_bluffs: HashMap<String, u32>,
+    successful_bluffs: HashMap<String, u32>,
+    successful_challenges: HashMap<String, u32>,
+	failed_challenges: HashMap<String, u32>
+}
+
 impl fmt::Debug for Bot {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		if f.alternate() {
@@ -560,7 +568,7 @@ impl Coup {
     );
 
     // --- NEW: Print challenge summary ---
-   println!("\n📜 Final Challenge Summary:\n");
+   println!("\n📜 Challenge Summary:\n");
     for event in &self.history {
         match event {
             History::ChallengeResult { challenger, challenged, card,success } => {
@@ -594,7 +602,6 @@ impl Coup {
     }
 
 	
-
 	for bot in &self.bots {
 		let name = &bot.name;
 		println!("🤖 {}", name);
@@ -603,7 +610,6 @@ impl Coup {
 }
 
 		println!("\n📊 Bluff Statistics\n");
-
 for bot in &self.bots {
     let name = &bot.name;
     println!("🤖 {}", name);
@@ -1254,7 +1260,31 @@ for bot in &self.bots {
 			});
 		}
 	}
+/*
+	fn display_score1(&mut self) {
+    // Print every 1/1000th of rounds or at the end
+    let fps = (self.rounds as f64 / 1000.0).max(1.0) as u64;
 
+    if self.round == 0 || self.round % fps == 0 || self.round + 1 == self.rounds {
+        // If this isn't the first round, move cursor up to overwrite previous
+        if self.round > 0 {
+            print!("\x1b[{}A\x1b[2K", self.bots.len() + 1);
+        }
+
+        let done_percent = (((self.round + 1) as f64 / self.rounds as f64) * 100.0).round();
+        println!("\x1b[2K {:>3}% done", done_percent);
+
+        // Print number of wins per bot
+        println!("🏆 Game Wins so far:");
+        for bot in &self.bots {
+            let wins = self.wins.get(&bot.name).unwrap_or(&0);
+            println!("🤖 {:<15} : {} wins", bot.name, wins);
+        }
+
+        println!(); // extra spacing
+    }
+}
+ */
 	fn format_number_with_separator(mut number: u64) -> String {
 		if number == 0 {
 			return String::from("0");
@@ -1276,7 +1306,15 @@ for bot in &self.bots {
 
 	/// Play n number of rounds and tally up the score in the CLI.
 	pub fn looping(&mut self, rounds: u64) {
-		self.setup();
+
+		let mut multipleGameStats = MultipleGameStats {
+			total_bluffs: HashMap::new(),
+			caught_bluffs: HashMap::new(),
+			successful_bluffs: HashMap::new(),
+			successful_challenges: HashMap::new(),
+			failed_challenges: HashMap::new(),
+		};
+				self.setup();
 		self.log = false;
 		self.rounds = rounds;
 
@@ -1301,6 +1339,30 @@ for bot in &self.bots {
 		for round in 0..rounds {
 			self.setup();
 			self.play();
+
+			// Merge per-game stats into multipleGameStats
+
+		for (name, value) in &self.total_bluffs {
+			*multipleGameStats.total_bluffs.entry(name.clone()).or_insert(0) += value;
+		}
+
+		for (name, value) in &self.caught_bluffs {
+			*multipleGameStats.caught_bluffs.entry(name.clone()).or_insert(0) += value;
+		}
+
+		for (name, value) in &self.successful_bluffs {
+			*multipleGameStats.successful_bluffs.entry(name.clone()).or_insert(0) += value;
+		}
+
+		for (name, value) in &self.successful_challenges {
+			*multipleGameStats.successful_challenges.entry(name.clone()).or_insert(0) += value;
+		}
+
+		for (name, value) in &self.failed_challenges {
+			*multipleGameStats.failed_challenges.entry(name.clone()).or_insert(0) += value;
+		}
+
+
 
 			// Collect challenge-related events from this round
 			all_challenges.extend(
@@ -1328,43 +1390,34 @@ for bot in &self.bots {
 				.0
 		);
 
+		println!("\n📜 Final Challenge Summary:\n");
 
-println!("\n📜 Final Challenge Summary Across All Games:\n");
+		for bot in &self.bots {
+			let name = &bot.name;
 
-let mut challenge_summary: HashMap<String, (u32, u32)> = HashMap::new();
-// (successful, failed) challenges
+			let successful = multipleGameStats
+				.successful_challenges
+				.get(name)
+				.unwrap_or(&0);
 
-for event in &self.all_history {
-    match event {
-        History::ChallengeResult { challenger, challenged: _, card: _, success } => {
-            let entry = challenge_summary.entry(challenger.clone()).or_insert((0, 0));
-            if *success { entry.0 += 1; } else { entry.1 += 1; }
-        }
-        History::CounterChallengeResult { challenger, counterer: _, cards: _, success } => {
-            let entry = challenge_summary.entry(challenger.clone()).or_insert((0, 0));
-            if *success { entry.0 += 1; } else { entry.1 += 1; }
-        }
-        _ => {}
-    }
-}
+			let failed = multipleGameStats
+				.failed_challenges
+				.get(name)
+				.unwrap_or(&0);
 
-// Print nicely
-for (player, (successes, failures)) in &challenge_summary {
-    println!(
-        "🤖 {} \n   Successful Challenges: {} \n   Failed Challenges: {}",
-        player, successes, failures
-    );
-}
+			println!("🤖 {}", name);
+			println!("   Successful Challenges: {}", successful);
+			println!("   Failed Challenges: {}", failed);
+		}
 
-println!("\n📊 Final Bluff Statistics Across All Games:\n");
+	println!("\n📊 Final Bluff Statistics:\n");
 
-for bot in &self.bots {
-    let name = &bot.name;
-    println!("🤖 {}", name);
-    println!("   Total Bluffs: {}", self.total_bluffs.get(name).unwrap_or(&0));
-    println!("   Caught Bluffs: {}", self.caught_bluffs.get(name).unwrap_or(&0));
-    println!("   Successful Bluffs: {}", self.successful_bluffs.get(name).unwrap_or(&0));
-}
+	for (name, total) in &multipleGameStats.total_bluffs {
+		println!("🤖 {}", name);
+		println!("   Total Bluffs: {}", total);
+		println!("   Caught Bluffs: {}", multipleGameStats.caught_bluffs.get(name).unwrap_or(&0));
+	}
+
 	}
 
 	
