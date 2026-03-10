@@ -12,7 +12,7 @@ fn main() {
 
         Box::new(MctsBot::default()),
         Box::new(HonestBot),
-        //Box::new(DuelBot),
+        Box::new(DuelBot),
         //Box::new(Human),
         //Box::new(HonestBot)
         Box::new(RandomBot)
@@ -22,5 +22,5 @@ fn main() {
     //coup_game.play();
 
     // Or play multiple games
-    coup_game.looping(100);
+    coup_game.looping(10);
 }
