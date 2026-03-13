@@ -78,7 +78,7 @@ impl BotInterface for MctsBot {
         // the search will determinize and simulate internally.
         let action = mcts.search(context, &policy).unwrap_or(Action::Income);
 
-        println!("MCTSBot chose: {:?}", action);
+        //println!("MCTSBot chose: {:?}", action);
         action
     }
 
