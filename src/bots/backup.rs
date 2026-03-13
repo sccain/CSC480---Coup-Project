@@ -1,22 +1,28 @@
+// duel_brain.rs
+//! A lightweight belief + opponent modelling brain.
+//!
+//! This started life as a 1v1 "DuelBrain". For the MCTS bot we extend it to support
+//! multi-player, and to act as a **playout policy** for simulated challenge/counter
+//! rounds.
+//!
+//! What this brain provides:
+//! - Per-opponent claim counts (credibility model)
+//! - Simple challenge/counter decisions based on (a) deck scarcity, (b) credibility,
+//!   (c) stakes/tempo
+//! - A turn policy that chooses targets and actions in a multi-player setting
+//!
+//! It is intentionally cheap: in MCTS we call it *a lot*.
+
+use std::collections::HashMap;
+
 use crate::{
     bot::{Context, OtherBot},
     Action, Card, History,
 };
 
+use crate::mcts::sim_state::PlayoutPolicy;
+
 const N_CARDS: usize = 5;
-
-#[derive(Clone, Default)]
-pub struct DuelMemory {
-    pub seen_history_len: usize,
-    pub opp_claims: [u32; N_CARDS],
-    pub my_assassination_pending: bool,
-    pub assassination_blocked_streak: u32,
-}
-
-#[derive(Clone, Default)]
-pub struct DuelBrain {
-    pub mem: DuelMemory,
-}
 
 fn card_idx(c: Card) -> usize {
     match c {
@@ -32,105 +38,87 @@ fn sigmoid(x: f64) -> f64 {
     1.0 / (1.0 + (-x).exp())
 }
 
+#[derive(Clone, Default)]
+struct OppStats {
+    // Credibility model: how often we've seen them claim each role (action or counter).
+    claims: [u32; N_CARDS],
+    // Behavioural model: how often they challenge.
+    challenges: u32,
+    opportunities_to_challenge: u32,
+}
+
+#[derive(Clone, Default)]
+pub struct DuelBrain {
+    seen_history_len: usize,
+    // Per-opponent statistics
+    opp: HashMap<String, OppStats>,
+}
+
 impl DuelBrain {
     pub fn new() -> Self {
         Self::default()
     }
 
     pub fn reset(&mut self) {
-        self.mem = DuelMemory::default();
+        self.seen_history_len = 0;
+        self.opp.clear();
     }
 
+    /// Update opponent models from the public game history.
     pub fn update_from_history(&mut self, context: &Context) {
-        // Reset at start of new game
         if context.history.is_empty() {
+            // New game.
             self.reset();
             return;
         }
-
-        if self.mem.seen_history_len >= context.history.len() {
+        if self.seen_history_len >= context.history.len() {
             return;
         }
 
-        // 1v1 opponent name (DuelBot is intended for duels)
-        let opp_name = context
-            .playing_bots
-            .iter()
-            .find(|b| b.name != context.name)
-            .unwrap()
-            .name
-            .clone();
-
-        for h in &context.history[self.mem.seen_history_len..] {
+        for h in &context.history[self.seen_history_len..] {
             match h {
-                History::ActionTax { by } if *by == opp_name => {
-                    self.mem.opp_claims[card_idx(Card::Duke)] += 1;
+                // Action claims
+                History::ActionTax { by } => {
+                    self.opp.entry(by.clone()).or_default().claims[card_idx(Card::Duke)] += 1;
                 }
-                History::ActionAssassination { by, .. } if *by == opp_name => {
-                    self.mem.opp_claims[card_idx(Card::Assassin)] += 1;
+                History::ActionAssassination { by, .. } => {
+                    self.opp.entry(by.clone()).or_default().claims[card_idx(Card::Assassin)] += 1;
                 }
-                History::ActionStealing { by, .. } if *by == opp_name => {
-                    self.mem.opp_claims[card_idx(Card::Captain)] += 1;
+                History::ActionStealing { by, .. } => {
+                    self.opp.entry(by.clone()).or_default().claims[card_idx(Card::Captain)] += 1;
                 }
-                History::ActionSwapping { by } if *by == opp_name => {
-                    self.mem.opp_claims[card_idx(Card::Ambassador)] += 1;
-                }
-
-                History::CounterForeignAid { by, .. } if *by == opp_name => {
-                    self.mem.opp_claims[card_idx(Card::Duke)] += 1;
-                }
-                History::CounterAssassination { by, .. } if *by == opp_name => {
-                    self.mem.opp_claims[card_idx(Card::Contessa)] += 1;
-
-                    if self.mem.my_assassination_pending {
-                        self.mem.assassination_blocked_streak =
-                            self.mem.assassination_blocked_streak.saturating_add(1);
-                        self.mem.my_assassination_pending = false;
-                    }
-                }
-                History::CounterStealing { by, .. } if *by == opp_name => {
-                    self.mem.opp_claims[card_idx(Card::Captain)] += 1;
-                    self.mem.opp_claims[card_idx(Card::Ambassador)] += 1;
+                History::ActionSwapping { by } => {
+                    self.opp
+                        .entry(by.clone())
+                        .or_default()
+                        .claims[card_idx(Card::Ambassador)] += 1;
                 }
 
-                // Our actions reset certain patterns
-                History::ActionAssassination { by, .. } if *by == context.name => {
-                    self.mem.my_assassination_pending = true;
+                // Counter claims
+                History::CounterForeignAid { by, .. } => {
+                    self.opp.entry(by.clone()).or_default().claims[card_idx(Card::Duke)] += 1;
                 }
-                History::ActionTax { by } if *by == context.name => {
-                    self.mem.my_assassination_pending = false;
-                    self.mem.assassination_blocked_streak = 0;
+                History::CounterAssassination { by, .. } => {
+                    self.opp
+                        .entry(by.clone())
+                        .or_default()
+                        .claims[card_idx(Card::Contessa)] += 1;
                 }
-                History::ActionStealing { by, .. } if *by == context.name => {
-                    self.mem.my_assassination_pending = false;
-                    self.mem.assassination_blocked_streak = 0;
-                }
-                History::ActionSwapping { by } if *by == context.name => {
-                    self.mem.my_assassination_pending = false;
-                    self.mem.assassination_blocked_streak = 0;
+                History::CounterStealing { by, .. } => {
+                    let s = self.opp.entry(by.clone()).or_default();
+                    s.claims[card_idx(Card::Captain)] += 1;
+                    s.claims[card_idx(Card::Ambassador)] += 1;
                 }
 
                 _ => {}
             }
         }
 
-        self.mem.seen_history_len = context.history.len();
+        self.seen_history_len = context.history.len();
     }
 
-    fn opp_claims(&self, card: Card) -> u32 {
-        self.mem.opp_claims[card_idx(card)]
-    }
-
-    fn assassination_blocked_streak(&self) -> u32 {
-        self.mem.assassination_blocked_streak
-    }
-
-    fn set_assassination_pending(&mut self, pending: bool) {
-        self.mem.my_assassination_pending = pending;
-    }
-
-    fn opponent<'a>(&self, context: &'a Context) -> &'a OtherBot {
-        context.playing_bots.iter().find(|b| b.name != context.name).unwrap()
+    fn opponent<'a>(&self, context: &'a Context, name: &str) -> Option<&'a OtherBot> {
+        context.playing_bots.iter().find(|b| b.name == name)
     }
 
     fn visible_count(context: &Context, card: Card) -> usize {
@@ -162,301 +150,370 @@ impl DuelBrain {
         num / den
     }
 
-    fn p_opponent_has(&self, context: &Context, opp_cards: i32, card: Card) -> f64 {
+    /// Baseline probability an opponent has `card`, based only on deck composition.
+    fn p_has_base(context: &Context, opp_cards: i32, card: Card) -> f64 {
         let n = Self::hidden_total(context);
         let k = Self::remaining_copies(context, card);
-
         if k == 0 || opp_cards <= 0 || n <= 0 {
             return 0.0;
         }
-
         let h = opp_cards.min(n);
-        let base = 1.0 - (Self::n_choose_k(n - k, h) / Self::n_choose_k(n, h));
+        1.0 - (Self::n_choose_k(n - k, h) / Self::n_choose_k(n, h))
+    }
 
-        // Credibility boost based on repeated claims
-        let claims = self.opp_claims(card) as f64;
-        let mut odds = base / (1.0 - base + 1e-9);
-        odds *= (0.35 * claims).exp();
+    /// Belief that `opp_name` has `card`, with a credibility adjustment.
+    fn p_opponent_has(&self, context: &Context, opp_name: &str, opp_cards: i32, card: Card) -> f64 {
+        let base = Self::p_has_base(context, opp_cards, card).clamp(0.0001, 0.9999);
 
+        // Credibility boost based on repeated claims.
+        let claims = self
+            .opp
+            .get(opp_name)
+            .map(|s| s.claims[card_idx(card)] as f64)
+            .unwrap_or(0.0);
+
+        // Convert to odds, scale, convert back.
+        let mut odds = base / (1.0 - base);
+        odds *= (0.30 * claims).exp();
         (odds / (1.0 + odds)).clamp(0.001, 0.999)
     }
 
-    fn p_opponent_challenges_claim(&self, context: &Context, claimed_role: Card, stake: f64) -> f64 {
-        let opp = self.opponent(context);
+    /// Estimated probability `player_name` challenges a claim of `claimed_role` by someone else.
+    fn p_player_challenges_claim(
+        &self,
+        context: &Context,
+        player_name: &str,
+        claimed_role: Card,
+        stake: f64,
+        actor_cards: i32,
+    ) -> f64 {
+        // Scarcity: rarer roles are more likely to be challenged.
+        let remaining = Self::remaining_copies(context, claimed_role) as f64;
+        let scarcity = 1.0 - (remaining / 3.0);
 
-        let remaining = Self::remaining_copies(context, claimed_role).max(0) as f64;
+        // If the role literally cannot exist, challenge is almost certain.
         if remaining <= 0.0 {
-            return 0.999;
+            return 0.99;
         }
 
-        let scarcity = 1.0 - (remaining / 3.0);
-        let p_opp_has_role = self.p_opponent_has(context, opp.cards as i32, claimed_role);
-        let cover_effect = (p_opp_has_role - 0.5) * -0.4;
+        // If *we* likely have the role, we may be less incentivized to challenge (we can block, etc.).
+        let my_cards = context.cards.len() as i32;
+        let p_i_have = Self::p_has_base(context, my_cards, claimed_role);
 
-        let inf_adv = (opp.cards as f64) - (context.cards.len() as f64);
-        let coin_adv = (opp.coins as f64) - (context.coins as f64);
+        // Actor credibility: if actor has claimed this role often, challenge less.
+        // We don't know the actor name here; so we use a generic actor_cards pressure term.
+        let actor_pressure = (actor_cards as f64 - 1.0) * -0.12;
 
+        // Player aggression: based on observed challenge frequency.
+        let aggress = self
+            .opp
+            .get(player_name)
+            .map(|s| {
+                let denom = (s.opportunities_to_challenge.max(1)) as f64;
+                (s.challenges as f64 / denom).clamp(0.0, 1.0)
+            })
+            .unwrap_or(0.25);
+
+        let inf_adv = (context.cards.len() as f64) - 1.0;
         let x =
-            -0.65
-            + 1.55 * scarcity
-            + 0.35 * inf_adv
-            + 0.12 * coin_adv
-            + cover_effect
-            + 0.35 * (stake - 1.0);
+            -0.70 + 1.40 * scarcity + 0.35 * (stake - 1.0) + 0.15 * aggress + actor_pressure
+                - 0.30 * (p_i_have - 0.5)
+                + 0.05 * inf_adv;
 
         sigmoid(x).clamp(0.01, 0.99)
     }
 
-    fn bluff_ev_ok(&self, context: &Context, role: Card, stake: f64, reward_delta: f64) -> bool {
-        if Self::remaining_copies(context, role) == 0 {
+    fn choose_best_coup_target(&self, context: &Context) -> Option<String> {
+        let mut best: Option<(&OtherBot, f64)> = None;
+        for b in &context.playing_bots {
+            if b.name == context.name || b.cards == 0 {
+                continue;
+            }
+            // Target score: high influence + high coins.
+            let score = (b.cards as f64) * 1.3 + (b.coins as f64) * 0.25;
+            if best.map(|(_, s)| score > s).unwrap_or(true) {
+                best = Some((b, score));
+            }
+        }
+        best.map(|(b, _)| b.name.clone())
+    }
+
+    fn choose_best_soft_target(&self, context: &Context) -> Option<String> {
+        let mut best: Option<(&OtherBot, f64)> = None;
+        for b in &context.playing_bots {
+            if b.name == context.name || b.cards == 0 {
+                continue;
+            }
+            // Prefer low influence, high coins (easier elimination / big steal value).
+            let score = (7.0 - b.cards as f64) * 1.1 + (b.coins as f64) * 0.35;
+            if best.map(|(_, s)| score > s).unwrap_or(true) {
+                best = Some((b, score));
+            }
+        }
+        best.map(|(b, _)| b.name.clone())
+    }
+
+    fn should_block_foreign_aid(&self, context: &Context, by: &str) -> bool {
+        // Truthfully block if we have Duke.
+        if context.cards.contains(&Card::Duke) {
+            return true;
+        }
+
+        // If Duke cannot exist, don't bluff.
+        if Self::remaining_copies(context, Card::Duke) == 0 {
             return false;
         }
 
-        let p_chal = self.p_opponent_challenges_claim(context, role, stake);
-        let p_no = 1.0 - p_chal;
+        // Block more if actor is close to coup tempo.
+        let actor = self.opponent(context, by);
+        let actor_coins = actor.map(|a| a.coins as i32).unwrap_or(0);
+        let near_coup = actor_coins >= 6;
+
+        // If we are ahead, we can accept FA sometimes.
+        let my_inf = context.cards.len() as i32;
+        let my_ahead = actor.map(|a| my_inf > a.cards as i32).unwrap_or(false);
+
+        // Default bluff-block rate.
+        if near_coup {
+            !my_ahead
+        } else {
+            false
+        }
+    }
+
+    fn should_block_steal(&self, context: &Context, by: &str) -> bool {
+        if context.cards.contains(&Card::Captain) || context.cards.contains(&Card::Ambassador) {
+            return true;
+        }
+        // If both roles cannot exist, don't bluff.
+        if Self::remaining_copies(context, Card::Captain) == 0 && Self::remaining_copies(context, Card::Ambassador) == 0
+        {
+            return false;
+        }
+        // Bluff-block more if we're low on coins or the thief is rich.
+        let thief = self.opponent(context, by);
+        let thief_coins = thief.map(|t| t.coins).unwrap_or(0);
+        (context.coins <= 2 && thief_coins >= 3) || thief_coins >= 6
+    }
+
+    fn should_block_assassination(&self, context: &Context, by: &str) -> bool {
+        if context.cards.contains(&Card::Contessa) {
+            return true;
+        }
+        if Self::remaining_copies(context, Card::Contessa) == 0 {
+            return false;
+        }
+        // With 1 influence left, blocking is extremely valuable.
+        if context.cards.len() <= 1 {
+            return true;
+        }
+        // Bluff-block if the assassin is rich or has pressured before.
+        let a = self.opponent(context, by);
+        a.map(|a| a.coins >= 4).unwrap_or(true)
+    }
+
+    fn should_challenge_action_inner(&mut self, context: &Context, action: &Action, by: &str) -> bool {
+        let actor = self.opponent(context, by);
+        let Some(actor) = actor else { return false; };
+
+        let (role, reward_delta, stake) = match action {
+            Action::Tax => (Card::Duke, 1.2, 1.05),
+            Action::Swapping => (Card::Ambassador, 0.7, 1.00),
+            Action::Stealing(target) if target == &context.name => (Card::Captain, 1.8, 1.15),
+            Action::Assassination(target) if target == &context.name => (Card::Assassin, 3.0, 1.45),
+            Action::Stealing(_) => (Card::Captain, 0.8, 1.05),
+            Action::Assassination(_) => (Card::Assassin, 1.4, 1.15),
+            _ => return false,
+        };
+
+        if Self::remaining_copies(context, role) == 0 {
+            return true;
+        }
+
+        // Belief actor has role.
+        let p_has = self.p_opponent_has(context, &actor.name, actor.cards as i32, role);
+        let p_bluff = 1.0 - p_has;
 
         let risk_loss = if context.cards.len() <= 1 { 2.0 } else { 1.0 };
-        let ev = p_no * reward_delta - p_chal * risk_loss;
+        let ev = p_bluff * reward_delta - (1.0 - p_bluff) * risk_loss;
 
-        ev > 0.10
+        // Update opportunity count.
+        self.opp.entry(actor.name.clone()).or_default().opportunities_to_challenge += 1;
+
+        ev > (0.85 + 0.25 * (stake - 1.0))
     }
 
-    fn imminent_coup_loss(&self, context: &Context) -> bool {
-        let opp = self.opponent(context);
-        context.cards.len() <= 1 && opp.coins >= 7
-    }
+    fn should_challenge_counter_inner(&mut self, context: &Context, action: &Action, by: &str) -> bool {
+        let blocker = self.opponent(context, by);
+        let Some(blocker) = blocker else { return false; };
 
-    fn opponent_coup_threat_next_turn(&self, context: &Context) -> bool {
-        let opp = self.opponent(context);
-        opp.coins >= 6 || opp.coins >= 4
-    }
-
-    fn should_attempt_assassination(&self, context: &Context) -> bool {
-        if context.coins < 3 {
-            return false;
-        }
-
-        let opp = self.opponent(context);
-        let streak = self.assassination_blocked_streak();
-        let p_contessa = self.p_opponent_has(context, opp.cards as i32, Card::Contessa);
-
-        if streak >= 1 && p_contessa > 0.55 {
-            return false;
-        }
-        if streak >= 2 && p_contessa > 0.40 {
-            return false;
-        }
-
-        true
-    }
-
-    fn should_bluff_block_steal(&self, context: &Context, by: &str) -> bool {
-        // If all copies are visible, don't bluff a block that cannot exist.
-        let can_claim_captain = Self::remaining_copies(context, Card::Captain) > 0;
-        let can_claim_ambassador = Self::remaining_copies(context, Card::Ambassador) > 0;
-        if !can_claim_captain && !can_claim_ambassador {
-            return false;
-        }
-
-        // Find the stealing player (duels: should exist)
-        let opp = context.playing_bots.iter().find(|b| b.name == by);
-
-        // If we can't find them (weird state), default to bluff-blocking (safe for duels).
-        let Some(opp) = opp else {
-            return true;
+        let (roles, reward_delta, stake) = match action {
+            Action::ForeignAid => (vec![Card::Duke], 1.1, 1.05),
+            Action::Stealing(_) => (vec![Card::Captain, Card::Ambassador], 1.5, 1.10),
+            Action::Assassination(_) => (vec![Card::Contessa], 2.2, 1.30),
+            _ => return false,
         };
 
-        // If they have already demonstrated stealing, treat it as a big threat:
-        // In your model, opponent Stealing claims increment Captain claim count.
-        let steal_claims = self.opp_claims(Card::Captain);
-
-        // If we're behind on coins or they can reach coup tempo soon, block more.
-        let coin_gap = (opp.coins as i32) - (context.coins as i32);
-
-        // Estimate how likely they are to challenge *our* block claim.
-        // We'll choose the "safer" claim (Captain vs Ambassador) to bluff.
-        let p_chal_cap = if can_claim_captain {
-            self.p_opponent_challenges_claim(context, Card::Captain, 1.05)
-        } else {
-            1.0
-        };
-        let p_chal_amb = if can_claim_ambassador {
-            self.p_opponent_challenges_claim(context, Card::Ambassador, 1.05)
-        } else {
-            1.0
-        };
-
-        let best_p_chal = p_chal_cap.min(p_chal_amb);
-
-        // Aggressive policy:
-        // - If opponent is already stealing (or ahead), bluff-block unless challenge is extremely likely.
-        // - Otherwise still bluff-block fairly often (because repeated steals snowball hard in duels).
-        if steal_claims >= 1 || coin_gap >= 1 || opp.coins >= 5 {
-            best_p_chal < 0.70
-        } else {
-            best_p_chal < 0.55
-        }
-    }
-
-    fn should_bluff_block_assassination(&self, context: &Context, by: &str) -> bool {
-        // Only Contessa can block assassination.
-        // If all Contessas are visible, don't bluff a block that cannot exist.
-        let can_claim_contessa = Self::remaining_copies(context, Card::Contessa) > 0;
-        if !can_claim_contessa {
-            return false;
-        }
-
-        // Find the acting player (duels: should exist)
-        let opp = context.playing_bots.iter().find(|b| b.name == by);
-
-        // If we can't find them (weird state), default to bluff-blocking.
-        // (Same reasoning as your steal function: in a duel this "shouldn't happen".)
-        let Some(opp) = opp else {
-            return true;
-        };
-
-        // Threat / tempo heuristics:
-        // - Assassination is huge in duels (often worth bluff-blocking, especially at 1 influence).
-        // - If we are on our last influence, we should block unless they're *very* likely to challenge.
-        let one_influence_left = context.cards.len() <= 1;
-
-        // If they are rich, they can keep pressuring; blocks buy time.
-        // (Assassination costs 3, so having >= 3 means the threat is "live".)
-        let opp_can_assassinate_again_soon = opp.coins >= 3;
-
-        // If they are close to coup tempo, preserving influence matters a lot.
-        let opp_near_coup = opp.coins >= 6;
-
-        // Optional: if your model records assassination behavior as Assassin claims,
-        // you can use it to treat them as "more credible" (so we bluff-block slightly less).
-        // If you don't track this, just remove these two lines and keep credible_assassin = false.
-        let assassin_claims = self.opp_claims(Card::Assassin);
-        let credible_assassin = assassin_claims >= 1;
-
-        // Estimate how likely they are to challenge our Contessa claim.
-        // Use the same calibration factor you used for steal (1.05) unless you have a reason to change it.
-        let p_chal = self.p_opponent_challenges_claim(context, Card::Contessa, 1.05);
-
-        // Policy:
-        // - If we're at 1 influence: bluff-block unless challenge is extremely likely.
-        // - If they are near coup / can keep assassinating: still block fairly aggressively.
-        // - If they look credible as Assassin: require lower challenge probability (they're more likely to call you).
-        if one_influence_left {
-            // Desperation mode: block even if likely to be challenged, but not when it's basically guaranteed.
-            p_chal < 0.85
-        } else if opp_near_coup || opp_can_assassinate_again_soon {
-            if credible_assassin {
-                p_chal < 0.60
-            } else {
-                p_chal < 0.70
+        let mut p_has_block: f64 = 0.0;
+        for r in roles {
+            if Self::remaining_copies(context, r) == 0 {
+                continue;
             }
-        } else {
-            // If they're not pressuring much, only bluff-block when we expect relatively low challenge probability.
-            if credible_assassin {
-                p_chal < 0.50
-            } else {
-                p_chal < 0.55
-            }
+            p_has_block = p_has_block.max(self.p_opponent_has(context, &blocker.name, blocker.cards as i32, r));
         }
+        let p_bluff = 1.0 - p_has_block;
+
+        let risk_loss = if context.cards.len() <= 1 { 2.0 } else { 1.0 };
+        let ev = p_bluff * reward_delta - (1.0 - p_bluff) * risk_loss;
+
+        self.opp.entry(blocker.name.clone()).or_default().opportunities_to_challenge += 1;
+
+        ev > (0.85 + 0.30 * (stake - 1.0))
     }
 
     /// Decide whether to counter/block an opponent action.
-    /// Return `true` to counter, `false` otherwise.
-    ///
-    /// Currently we focus on blocking Stealing aggressively (Captain/Ambassador).
     pub fn decide_counter(&mut self, action: &Action, by: &str, context: &Context) -> bool {
         self.update_from_history(context);
-
         match action {
-            Action::Stealing(target) if target == &context.name => {
-                if context.cards.contains(&Card::Captain) || context.cards.contains(&Card::Ambassador)
-                {
-                    return true;
-                }
-                self.should_bluff_block_steal(context, by)
-            }
-
-            Action::Assassination(target) if target == &context.name => {
-                if context.cards.contains(&Card::Contessa) {
-                    return true;
-                }
-                self.should_bluff_block_assassination(context, by)
-            }
-
+            Action::ForeignAid => self.should_block_foreign_aid(context, by),
+            Action::Stealing(target) if target == &context.name => self.should_block_steal(context, by),
+            Action::Assassination(target) if target == &context.name => self.should_block_assassination(context, by),
             _ => false,
         }
     }
 
-    /// Main “duel policy” action selection (same as DuelBot’s on_turn).
+    /// Decide whether to challenge an opponent's action claim.
+    pub fn decide_challenge_action(&mut self, action: &Action, by: &str, context: &Context) -> bool {
+        self.update_from_history(context);
+        self.should_challenge_action_inner(context, action, by)
+    }
+
+    /// Decide whether to challenge an opponent's counter claim.
+    pub fn decide_challenge_counter(&mut self, action: &Action, by: &str, context: &Context) -> bool {
+        self.update_from_history(context);
+        self.should_challenge_counter_inner(context, action, by)
+    }
+
+    /// Multi-player turn policy.
     pub fn decide_turn(&mut self, context: &Context) -> Action {
         self.update_from_history(context);
 
-        let opp = self.opponent(context);
-        let target = opp.name.clone();
+        // Forced coup if >= 10 coins.
+        if context.coins >= 10 {
+            if let Some(t) = self.choose_best_coup_target(context) {
+                return Action::Coup(t);
+            }
+            return Action::Income;
+        }
 
+        // Coup if possible (good default in Coup).
         if context.coins >= 7 {
-            self.set_assassination_pending(false);
-            return Action::Coup(target);
-        }
-
-        if self.imminent_coup_loss(context) {
-            if opp.cards <= 1
-                && context.coins >= 3
-                && (context.cards.contains(&Card::Assassin)
-                    || self.bluff_ev_ok(context, Card::Assassin, 1.45, 2.5))
-                && self.should_attempt_assassination(context)
-            {
-                self.set_assassination_pending(true);
-                return Action::Assassination(target);
-            }
-
-            if opp.coins >= 2
-                && (context.cards.contains(&Card::Captain)
-                    || self.bluff_ev_ok(context, Card::Captain, 1.20, 2.0))
-            {
-                self.set_assassination_pending(false);
-                return Action::Stealing(opp.name.clone());
-            }
-
-            if context.coins >= 3
-                && self.bluff_ev_ok(context, Card::Assassin, 1.55, 2.2)
-                && self.should_attempt_assassination(context)
-            {
-                self.set_assassination_pending(true);
-                return Action::Assassination(target);
+            if let Some(t) = self.choose_best_coup_target(context) {
+                return Action::Coup(t);
             }
         }
 
-        if context.coins >= 3
-            && (context.cards.contains(&Card::Assassin)
-                || self.bluff_ev_ok(context, Card::Assassin, 1.35, 1.8))
-            && self.should_attempt_assassination(context)
-        {
-            self.set_assassination_pending(true);
-            return Action::Assassination(target);
+        // Assassinate if we have assassin or if bluff seems safe.
+        if context.coins >= 3 {
+            if let Some(t) = self.choose_best_soft_target(context) {
+                // Don't assassinate if target very likely has contessa.
+                let p_contessa = self
+                    .opponent(context, &t)
+                    .map(|ob| self.p_opponent_has(context, &t, ob.cards as i32, Card::Contessa))
+                    .unwrap_or(0.35);
+                let has_assassin = context.cards.contains(&Card::Assassin);
+                if has_assassin || p_contessa < 0.55 {
+                    return Action::Assassination(t);
+                }
+            }
         }
 
-        if context.cards.contains(&Card::Duke) || self.bluff_ev_ok(context, Card::Duke, 1.10, 2.0) {
-            self.set_assassination_pending(false);
+        // Steal if someone is rich.
+        if let Some(t) = self.choose_best_soft_target(context) {
+            let coins = self.opponent(context, &t).map(|b| b.coins).unwrap_or(0);
+            if coins >= 2 {
+                return Action::Stealing(t);
+            }
+        }
+
+        // Tax if we have Duke, or if Duke is not extremely scarce.
+        if context.cards.contains(&Card::Duke) || Self::remaining_copies(context, Card::Duke) >= 1 {
             return Action::Tax;
         }
 
-        if opp.coins >= 2
-            && (context.cards.contains(&Card::Captain)
-                || self.bluff_ev_ok(context, Card::Captain, 1.05, 1.5)
-                || (self.opponent_coup_threat_next_turn(context)
-                    && self.bluff_ev_ok(context, Card::Captain, 1.25, 2.0)))
-        {
-            self.set_assassination_pending(false);
-            return Action::Stealing(opp.name.clone());
+        // Swapping is useful to reset beliefs when low influence.
+        if context.cards.len() <= 1 {
+            return Action::Swapping;
         }
 
-        if Self::remaining_copies(context, Card::Duke) >= 2 && context.history.len() % 3 == 0 {
-            self.set_assassination_pending(false);
+        // Otherwise: safe tempo.
+        if Self::remaining_copies(context, Card::Duke) >= 2 && context.coins <= 1 {
             return Action::ForeignAid;
         }
-
-        self.set_assassination_pending(false);
         Action::Income
+    }
+}
+
+// --- PlayoutPolicy implementation ---
+
+impl PlayoutPolicy for DuelBrain {
+    fn decide_turn(&self, player: &str, ctx: &Context) -> Action {
+        // Playouts use a cloned brain per rollout in the simulator; but this method
+        // takes &self for speed. We therefore use a tiny "stateless" heuristic here.
+        //
+        // The MCTSBot passes a *mutable* brain to search; the simulator will call the
+        // mutable wrappers below when it wants update-from-history effects.
+        if player == ctx.name {
+            // If we are called with ctx for the same player, fall back to a conservative policy.
+        }
+
+        // Simple heuristic: coup if possible, else tax, else income.
+        if ctx.coins >= 7 {
+            if let Some(t) = ctx
+                .playing_bots
+                .iter()
+                .filter(|b| b.cards > 0)
+                .max_by_key(|b| (b.cards, b.coins))
+                .map(|b| b.name.clone())
+            {
+                return Action::Coup(t);
+            }
+        }
+        if ctx.cards.contains(&Card::Duke) {
+            return Action::Tax;
+        }
+        Action::Income
+    }
+
+    fn decide_counter(&self, _player: &str, action: &Action, by: &str, ctx: &Context) -> bool {
+        // Stateless conservative counter policy.
+        match action {
+            Action::Stealing(target) if target == &ctx.name => {
+                ctx.cards.contains(&Card::Captain) || ctx.cards.contains(&Card::Ambassador)
+            }
+            Action::Assassination(target) if target == &ctx.name => ctx.cards.contains(&Card::Contessa),
+            Action::ForeignAid => ctx.cards.contains(&Card::Duke) && by != ctx.name,
+            _ => false,
+        }
+    }
+
+    fn decide_challenge_action(&self, _player: &str, _action: &Action, _by: &str, _ctx: &Context) -> bool {
+        // Stateless, low-challenge in rollouts.
+        false
+    }
+
+    fn decide_challenge_counter(&self, _player: &str, _action: &Action, _by: &str, _ctx: &Context) -> bool {
+        false
+    }
+
+    fn choose_influence_to_lose(&self, _player: &str, ctx: &Context) -> Option<Card> {
+        // Prefer to lose cards that are currently "less useful".
+        // This is a crude ordering.
+        for c in [Card::Ambassador, Card::Contessa, Card::Captain, Card::Assassin, Card::Duke] {
+            if ctx.cards.contains(&c) {
+                return Some(c);
+            }
+        }
+        None
     }
 }

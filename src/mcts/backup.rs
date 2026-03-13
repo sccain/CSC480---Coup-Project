@@ -10,30 +10,13 @@
 //! Notes / limitations:
 //! - Tuned for decision making, not perfect rule coverage.
 //! - We model at most one challenger per claim (picked stochastically).
-//! - We now keep a lightweight public history stream during rollouts so playout
-//!   policies can condition on "what just happened".
+//! - We do not rebuild a full engine History stream during rollouts; policies should
+//!   primarily use beliefs and public info.
 
 use rand::prelude::*;
-use std::collections::HashSet;
 
 use crate::bot::{Context, OtherBot};
-use crate::{Action, Card, History};
-
-// --- Anti-loop heuristics ----------------------------------------------------
-//
-// In practice, bots can get stuck repeating an action that is consistently
-// countered (blocked), or spamming Ambassador (Swapping) even after being
-// challenged. The public history may include intervening challenge entries
-// between the action and the eventual counter, so naive adjacency checks
-// (Action immediately followed by Counter) can fail.
-//
-// We apply a small "cooldown" for recently failed actions at the simulator
-// level so that both the MCTS root action set and rollout move generation avoid
-// pathological loops.
-
-const RECENT_FAILURE_WINDOW: usize = 14; // how far back to search for a failed attempt
-const POST_ACTION_LOOKAHEAD: usize = 4; // how far forward to look for the action's resolution
-const SWAP_COOLDOWN_ACTIONS: usize = 8; // how far back to prevent repeated Swapping
+use crate::{Action, Card};
 
 /// A policy hook used by the simulator during playouts.
 ///
@@ -83,32 +66,11 @@ pub struct SimState {
     pub root_name: String,
     pub players: Vec<SimPlayer>,
     pub to_move: usize,
-
-    /// Remaining deck in this determinization.
-    ///
-    /// Used for Exchange (Ambassador/Swapping) and for replacing a revealed card
-    /// after a truthful challenge/counter (real Coup rule).
-    pub deck: Vec<Card>,
-
     pub discard_pile: Vec<Card>,
 
-    /// Public history stream.
-    ///
-    /// This starts as the real engine history at determinization time, and we
-    /// append simulated public events during the rollout. This is critical so
-    /// rollout policies (like DuelBrain) can avoid degenerate loops like
-    /// "keep trying to steal into a known blocker".
-    pub history: Vec<History>,
-
     /// Length of the engine's public history at the time of determinization.
+    /// (Kept for possible future extensions; unused by default.)
     pub public_history_len: usize,
-
-    /// Penalize "wasted tempo" for the root player (e.g., actions getting
-    /// blocked and not challenged).
-    root_tempo_waste: f32,
-
-    /// Penalty for entering a repeated public-ish state loop.
-    loop_penalty: f32,
 }
 
 impl SimState {
@@ -176,12 +138,8 @@ impl SimState {
             root_name: context.name.clone(),
             players,
             to_move: 0,
-            deck,
             discard_pile: context.discard_pile.clone(),
-            history: context.history.clone(),
             public_history_len: context.history.len(),
-            root_tempo_waste: 0.0,
-            loop_penalty: 0.0,
         }
     }
 
@@ -231,12 +189,7 @@ impl SimState {
         let opp_tempo_threat = 0.04 * (opp_best_coin / 7.0);
         let rich_penalty = 0.02 * ((root_coin - 8.0).max(0.0) / 5.0);
 
-        // Penalize tempo waste (blocked actions that didn't resolve) and loops.
-        let tempo_penalty = 0.04 * self.root_tempo_waste;
-        let loop_penalty = 0.15 * self.loop_penalty;
-
-        (0.5 + inf_term + coin_term - opp_tempo_threat - rich_penalty - tempo_penalty - loop_penalty)
-            .clamp(0.0, 1.0)
+        (0.5 + inf_term + coin_term - opp_tempo_threat - rich_penalty).clamp(0.0, 1.0)
     }
 
     fn current_player_idx(&self) -> usize {
@@ -248,8 +201,9 @@ impl SimState {
     }
 
     fn opponent_indices_of(&self, player_idx: usize) -> impl Iterator<Item = usize> + '_ {
-        (0..self.players.len())
-            .filter(move |i| *i != player_idx && !self.players[*i].cards.is_empty())
+        (0..self.players.len()).filter(move |i| {
+            *i != player_idx && !self.players[*i].cards.is_empty()
+        })
     }
 
     fn find_idx_by_name(&self, name: &str) -> Option<usize> {
@@ -270,6 +224,8 @@ impl SimState {
     }
 
     /// Public-ish context for the given player index.
+    ///
+    /// We keep `history` empty during rollouts; the policy should primarily use beliefs.
     pub fn as_context_for_player(&self, player_idx: usize) -> Context {
         let me = &self.players[player_idx];
 
@@ -291,7 +247,7 @@ impl SimState {
             cards: me.cards.clone(),
             playing_bots,
             discard_pile: self.discard_pile.clone(),
-            history: self.history.clone(),
+            history: vec![],
             score: vec![],
         }
     }
@@ -329,98 +285,7 @@ impl SimState {
             }
         }
 
-        // Filter out actions that are very likely to be an immediate tempo-wasting repeat.
-        // This is intentionally conservative: it only removes actions that the public
-        // history indicates were just tried and then blocked/challenged.
-        a.into_iter()
-            .filter(|act| !self.action_is_on_cooldown(&me.name, act))
-            .collect()
-    }
-
-    /// Return true if the given `action` for `player_name` is on a short cooldown.
-    ///
-    /// The goal is to prevent "get blocked, repeat, get blocked" loops.
-    fn action_is_on_cooldown(&self, player_name: &str, action: &Action) -> bool {
-        // Coup is always allowed (and already forced at >= 10 coins).
-        if matches!(action, Action::Coup(_)) {
-            return false;
-        }
-
-        // Prevent repeated swapping regardless of outcome (it's a high-variance action
-        // in rollouts and is easy to spam).
-        if matches!(action, Action::Swapping) {
-            return self.recently_swapped(player_name);
-        }
-
-        // Prevent repeating an action that was just blocked.
-        self.recently_blocked(player_name, action)
-    }
-
-    fn recently_swapped(&self, player_name: &str) -> bool {
-        let h = &self.history;
-        let start = h.len().saturating_sub(SWAP_COOLDOWN_ACTIONS);
-        h[start..]
-            .iter()
-            .any(|e| matches!(e, History::ActionSwapping { by } if by == player_name))
-    }
-
-    /// True if `player_name` recently attempted the same `proposed` action and it
-    /// was countered (blocked) without the player even issuing a counter-challenge.
-    ///
-    /// We allow a few intervening entries between Action and Counter because the
-    /// action claim may have been challenged first.
-    fn recently_blocked(&self, player_name: &str, proposed: &Action) -> bool {
-        let h = &self.history;
-        if h.len() < 2 {
-            return false;
-        }
-
-        let start = h.len().saturating_sub(RECENT_FAILURE_WINDOW);
-
-        // Search for the most recent matching action by player, then see if a
-        // corresponding counter appears shortly after it.
-        for i in (start..h.len()).rev() {
-            if !history_is_matching_action(&h[i], player_name, proposed) {
-                continue;
-            }
-
-            let end = (i + 1 + POST_ACTION_LOOKAHEAD).min(h.len() - 1);
-            // Scan forward for a matching counter that targets the actor.
-            for k in (i + 1)..=end {
-                if let Some(blocker_name) = history_is_matching_counter(&h[k], player_name, proposed)
-                {
-                    // If the actor immediately challenged the counter, we don't
-                    // treat it as a "pure block loop" (even if the challenge fails).
-                    if k + 1 < h.len()
-                        && history_is_counter_challenge(&h[k + 1], player_name, &blocker_name, proposed)
-                    {
-                        return false;
-                    }
-                    return true;
-                }
-
-                // If we hit another action by this player, stop; we've moved past the
-                // resolution window for the candidate action.
-                if matches!(&h[k],
-                    History::ActionIncome { by }
-                        | History::ActionForeignAid { by }
-                        | History::ActionTax { by }
-                        | History::ActionSwapping { by }
-                        | History::ActionStealing { by, .. }
-                        | History::ActionAssassination { by, .. }
-                        | History::ActionCoup { by, .. }
-                    if by == player_name)
-                {
-                    break;
-                }
-            }
-
-            // Found a recent attempt but didn't find a counter in the resolution window.
-            // This isn't the blocked-loop case we're trying to prevent.
-            return false;
-        }
-
-        false
+        a
     }
 
     /// Run a complete playout from a chosen root action.
@@ -431,9 +296,6 @@ impl SimState {
         rng: &mut ThreadRng,
         max_depth: usize,
     ) -> f32 {
-        let mut seen: HashSet<Vec<u8>> = HashSet::new();
-        seen.insert(self.public_signature());
-
         self.apply_declared_action(first_action, policy, rng);
 
         for _ in 0..max_depth {
@@ -445,13 +307,6 @@ impl SimState {
             if self.current_player().cards.is_empty() {
                 self.to_move = self.next_alive_after(self.to_move);
                 continue;
-            }
-
-            // Loop detection: if we re-enter the same public-ish state, terminate.
-            let sig = self.public_signature();
-            if !seen.insert(sig) {
-                self.loop_penalty += 1.0;
-                break;
             }
 
             let actor_idx = self.to_move;
@@ -471,18 +326,6 @@ impl SimState {
         self.reward_for_root()
     }
 
-    fn public_signature(&self) -> Vec<u8> {
-        // Very cheap signature capturing the public-ish part of state.
-        // (to_move, per-player coins, per-player influence count)
-        let mut v = Vec::with_capacity(1 + self.players.len() * 2);
-        v.push(self.to_move as u8);
-        for p in &self.players {
-            v.push(p.coins);
-            v.push(p.cards.len() as u8);
-        }
-        v
-    }
-
     /// Apply a declared action, including challenge/counter phases, then advance turn.
     fn apply_declared_action<P: PlayoutPolicy>(
         &mut self,
@@ -499,29 +342,22 @@ impl SimState {
             return;
         }
 
-        // 0) Record action declaration in history.
-        let actor_name = self.players[actor_idx].name.clone();
-        self.push_action_history(&actor_name, action);
-
         // 1) Challenge action (if challengeable)
         // 2) Counter/block (if blockable)
         // 3) Challenge counter (if countered)
         // 4) Apply effect
+
+        let actor_name = self.players[actor_idx].name.clone();
 
         // (1) Action challenge
         if let Some(required_role) = required_role_for_action(action) {
             if let Some(challenger_idx) =
                 self.pick_challenger_for_action(action, &actor_name, policy, rng)
             {
-                let challenger_name = self.players[challenger_idx].name.clone();
-                self.push_action_challenge_history(required_role, &challenger_name, &actor_name);
-
                 let ok = self.player_has_role(actor_idx, required_role);
                 if ok {
                     // Challenger loses influence.
                     self.lose_influence(challenger_idx, policy, rng);
-                    // Actor reveals and replaces the claimed role.
-                    self.replace_revealed_card(actor_idx, required_role, rng);
                 } else {
                     // Actor lied: actor loses influence and action fails.
                     self.lose_influence(actor_idx, policy, rng);
@@ -551,8 +387,6 @@ impl SimState {
                 let bname = self.players[bi].name.clone();
                 let bctx = self.as_context_for_player(bi);
                 if policy.decide_counter(&bname, action, &actor_name, &bctx) {
-                    // Record the counter claim.
-                    self.push_counter_history(&bname, &actor_name, action);
                     blocked_by = Some(bi);
                     break;
                 }
@@ -567,29 +401,10 @@ impl SimState {
                 policy.decide_challenge_counter(&actor_name, action, &blocker_name, &act_ctx);
 
             if should_challenge {
-                self.push_counter_challenge_history(action, &actor_name, &blocker_name);
-
                 let ok = self.block_is_truthful(blocker_idx, action);
                 if ok {
                     // Challenger loses.
                     self.lose_influence(actor_idx, policy, rng);
-
-                    // Blocker reveals and replaces (real Coup rule).
-                    match action {
-                        Action::ForeignAid => self.replace_revealed_card(blocker_idx, Card::Duke, rng),
-                        Action::Assassination(_) => {
-                            self.replace_revealed_card(blocker_idx, Card::Contessa, rng)
-                        }
-                        Action::Stealing(_) => {
-                            if self.player_has_role(blocker_idx, Card::Captain) {
-                                self.replace_revealed_card(blocker_idx, Card::Captain, rng);
-                            } else if self.player_has_role(blocker_idx, Card::Ambassador) {
-                                self.replace_revealed_card(blocker_idx, Card::Ambassador, rng);
-                            }
-                        }
-                        _ => {}
-                    }
-
                     self.to_move = self.next_alive_after(self.to_move);
                     return;
                 } else {
@@ -599,25 +414,17 @@ impl SimState {
                 }
             } else {
                 // Not challenged: action is blocked.
-                if self.players[actor_idx].name == self.root_name {
-                    self.root_tempo_waste += 1.0;
-                }
                 self.to_move = self.next_alive_after(self.to_move);
                 return;
             }
         }
 
         // (4) Apply effect
-        self.apply_action_effect(action, policy, rng);
+        self.apply_action_effect(action, rng);
         self.to_move = self.next_alive_after(self.to_move);
     }
 
-    fn apply_action_effect<P: PlayoutPolicy>(
-        &mut self,
-        action: &Action,
-        _policy: &P,
-        rng: &mut ThreadRng,
-    ) {
+    fn apply_action_effect(&mut self, action: &Action, rng: &mut ThreadRng) {
         let actor_idx = self.to_move;
         match action {
             Action::Income => {
@@ -630,8 +437,8 @@ impl SimState {
                 self.players[actor_idx].coins = self.players[actor_idx].coins.saturating_add(3);
             }
             Action::Swapping => {
-                // Exchange (Ambassador): draw 2 from deck, choose 2 to keep, return 2.
-                self.exchange_cards(actor_idx, rng);
+                // Simplified: randomise the player's hand consistent with public info.
+                self.randomise_hand(actor_idx, rng);
             }
             Action::Stealing(target_name) => {
                 if let Some(ti) = self.find_idx_by_name(target_name) {
@@ -698,22 +505,6 @@ impl SimState {
         }
     }
 
-    fn replace_revealed_card(&mut self, player_idx: usize, role: Card, rng: &mut ThreadRng) {
-        // Real Coup rule: if you win a challenge, you reveal the card, then shuffle
-        // it back into the deck and draw a replacement.
-        if self.deck.is_empty() {
-            return;
-        }
-        if let Some(pos) = self.players[player_idx].cards.iter().position(|c| *c == role) {
-            // Put revealed role back.
-            self.deck.push(role);
-            self.deck.shuffle(rng);
-            // Draw replacement.
-            let drawn = self.deck.pop().unwrap();
-            self.players[player_idx].cards[pos] = drawn;
-        }
-    }
-
     fn lose_influence<P: PlayoutPolicy>(
         &mut self,
         player_idx: usize,
@@ -746,162 +537,58 @@ impl SimState {
         self.discard_pile.push(lost);
     }
 
-    fn exchange_cards(&mut self, player_idx: usize, rng: &mut ThreadRng) {
-        if self.players[player_idx].cards.is_empty() {
-            return;
-        }
+    fn randomise_hand(&mut self, player_idx: usize, rng: &mut ThreadRng) {
+        // IMPORTANT: Card doesn't derive Hash in your project, so do NOT use HashMap<Card,...>.
+        // Use fixed array counts for the 5 roles instead.
 
-        // Draw up to 2 from the deck.
-        let mut drawn: Vec<Card> = Vec::with_capacity(2);
-        for _ in 0..2 {
-            if let Some(c) = self.deck.pop() {
-                drawn.push(c);
+        fn idx(c: Card) -> usize {
+            match c {
+                Card::Duke => 0,
+                Card::Assassin => 1,
+                Card::Captain => 2,
+                Card::Ambassador => 3,
+                Card::Contessa => 4,
+            }
+        }
+        fn from_idx(i: usize) -> Card {
+            match i {
+                0 => Card::Duke,
+                1 => Card::Assassin,
+                2 => Card::Captain,
+                3 => Card::Ambassador,
+                _ => Card::Contessa,
             }
         }
 
-        // Candidate pool = current hand + drawn.
-        let mut pool = self.players[player_idx].cards.clone();
-        pool.extend_from_slice(&drawn);
+        // 3 copies of each role.
+        let mut counts = [3i32; 5];
 
-        // Choose best two by a simple heuristic.
-        let coins = self.players[player_idx].coins;
-        pool.sort_by_key(|c| std::cmp::Reverse(Self::card_exchange_value(*c, coins)));
-
-        let keep_n = self.players[player_idx].cards.len().min(2);
-        let keep: Vec<Card> = pool.into_iter().take(keep_n).collect();
-
-        // Return all other cards (including the ones we had but didn't keep and the drawn).
-        // We don't track exact identities of returned cards beyond the determinization;
-        // shuffling back into the deck is good enough here.
-        //
-        // Start by returning our previous hand.
-        for c in self.players[player_idx].cards.drain(..) {
-            self.deck.push(c);
+        // Remove discards and all currently-held cards from the pool.
+        for c in &self.discard_pile {
+            counts[idx(*c)] -= 1;
         }
-        // Return drawn cards.
-        for c in drawn {
-            self.deck.push(c);
-        }
-
-        // Remove kept cards from deck by swapping out the first matching copies.
-        // (We just pushed everything back, so these copies definitely exist.)
-        for k in &keep {
-            if let Some(i) = self.deck.iter().position(|x| x == k) {
-                self.deck.swap_remove(i);
+        for p in &self.players {
+            for c in &p.cards {
+                counts[idx(*c)] -= 1;
             }
         }
 
-        self.players[player_idx].cards = keep;
-        self.deck.shuffle(rng);
-    }
-
-    fn card_exchange_value(c: Card, coins: u8) -> i32 {
-        // A crude but stable value function to avoid "infinite ambassador".
-        // - Duke is universally strong.
-        // - Assassin becomes much better once you can afford it.
-        // - Captain is good tempo.
-        // - Contessa is defensive (medium).
-        // - Ambassador is utility (low-ish once you've already exchanged).
-        match c {
-            Card::Duke => 60,
-            Card::Assassin => {
-                if coins >= 3 {
-                    55
-                } else {
-                    35
-                }
+        // Build remaining deck.
+        let mut deck: Vec<Card> = Vec::new();
+        for i in 0..5 {
+            for _ in 0..counts[i].max(0) {
+                deck.push(from_idx(i));
             }
-            Card::Captain => 45,
-            Card::Contessa => 40,
-            Card::Ambassador => 30,
         }
-    }
+        deck.shuffle(rng);
 
-    fn push_action_history(&mut self, by: &str, action: &Action) {
-        let h = match action {
-            Action::Income => History::ActionIncome { by: by.to_string() },
-            Action::ForeignAid => History::ActionForeignAid { by: by.to_string() },
-            Action::Tax => History::ActionTax { by: by.to_string() },
-            Action::Swapping => History::ActionSwapping { by: by.to_string() },
-            Action::Stealing(t) => History::ActionStealing {
-                by: by.to_string(),
-                target: t.clone(),
-            },
-            Action::Assassination(t) => History::ActionAssassination {
-                by: by.to_string(),
-                target: t.clone(),
-            },
-            Action::Coup(t) => History::ActionCoup {
-                by: by.to_string(),
-                target: t.clone(),
-            },
-        };
-        self.history.push(h);
-    }
-
-    fn push_action_challenge_history(&mut self, claimed: Card, by: &str, target: &str) {
-        let h = match claimed {
-            Card::Assassin => History::ChallengeAssassin {
-                by: by.to_string(),
-                target: target.to_string(),
-            },
-            Card::Ambassador => History::ChallengeAmbassador {
-                by: by.to_string(),
-                target: target.to_string(),
-            },
-            Card::Captain => History::ChallengeCaptain {
-                by: by.to_string(),
-                target: target.to_string(),
-            },
-            Card::Duke => History::ChallengeDuke {
-                by: by.to_string(),
-                target: target.to_string(),
-            },
-            // Contessa isn't an action claim in this simplified model.
-            Card::Contessa => History::ChallengeDuke {
-                by: by.to_string(),
-                target: target.to_string(),
-            },
-        };
-        self.history.push(h);
-    }
-
-    fn push_counter_history(&mut self, by: &str, target: &str, action: &Action) {
-        let h = match action {
-            Action::ForeignAid => History::CounterForeignAid {
-                by: by.to_string(),
-                target: target.to_string(),
-            },
-            Action::Stealing(_) => History::CounterStealing {
-                by: by.to_string(),
-                target: target.to_string(),
-            },
-            Action::Assassination(_) => History::CounterAssassination {
-                by: by.to_string(),
-                target: target.to_string(),
-            },
-            _ => return,
-        };
-        self.history.push(h);
-    }
-
-    fn push_counter_challenge_history(&mut self, action: &Action, by: &str, target: &str) {
-        let h = match action {
-            Action::ForeignAid => History::CounterChallengeDuke {
-                by: by.to_string(),
-                target: target.to_string(),
-            },
-            Action::Stealing(_) => History::CounterChallengeCaptainAmbassedor {
-                by: by.to_string(),
-                target: target.to_string(),
-            },
-            Action::Assassination(_) => History::CounterChallengeContessa {
-                by: by.to_string(),
-                target: target.to_string(),
-            },
-            _ => return,
-        };
-        self.history.push(h);
+        let need = self.players[player_idx].cards.len();
+        self.players[player_idx].cards.clear();
+        for _ in 0..need {
+            if let Some(c) = deck.pop() {
+                self.players[player_idx].cards.push(c);
+            }
+        }
     }
 }
 
@@ -920,51 +607,4 @@ fn is_blockable(action: &Action) -> bool {
         action,
         Action::ForeignAid | Action::Stealing(_) | Action::Assassination(_)
     )
-}
-
-fn history_is_matching_action(h: &History, actor: &str, proposed: &Action) -> bool {
-    match (proposed, h) {
-        (Action::ForeignAid, History::ActionForeignAid { by }) => by == actor,
-        (Action::Tax, History::ActionTax { by }) => by == actor,
-        (Action::Income, History::ActionIncome { by }) => by == actor,
-        (Action::Swapping, History::ActionSwapping { by }) => by == actor,
-        (Action::Stealing(t2), History::ActionStealing { by, target: t1 }) => by == actor && t1 == t2,
-        (Action::Assassination(t2), History::ActionAssassination { by, target: t1 }) => by == actor && t1 == t2,
-        (Action::Coup(t2), History::ActionCoup { by, target: t1 }) => by == actor && t1 == t2,
-        _ => false,
-    }
-}
-
-/// If `h` is a counter that blocks `proposed` (declared by `actor`), return the
-/// blocker's name.
-fn history_is_matching_counter(h: &History, actor: &str, proposed: &Action) -> Option<String> {
-    match (proposed, h) {
-        (Action::ForeignAid, History::CounterForeignAid { by, target }) if target == actor => {
-            Some(by.clone())
-        }
-        (Action::Stealing(_), History::CounterStealing { by, target }) if target == actor => {
-            Some(by.clone())
-        }
-        (Action::Assassination(_), History::CounterAssassination { by, target })
-            if target == actor =>
-        {
-            Some(by.clone())
-        }
-        _ => None,
-    }
-}
-
-fn history_is_counter_challenge(h: &History, actor: &str, blocker: &str, proposed: &Action) -> bool {
-    match (proposed, h) {
-        (Action::ForeignAid, History::CounterChallengeDuke { by, target }) => {
-            by == actor && target == blocker
-        }
-        (Action::Stealing(_), History::CounterChallengeCaptainAmbassedor { by, target }) => {
-            by == actor && target == blocker
-        }
-        (Action::Assassination(_), History::CounterChallengeContessa { by, target }) => {
-            by == actor && target == blocker
-        }
-        _ => false,
-    }
 }

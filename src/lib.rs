@@ -518,14 +518,14 @@ impl Coup {
     // Let's play
     while self.playing_bots.len() > 1 {
         
-		println!("\n🃏 Current Card State:");
+		//println!("\n🃏 Current Card State:");
 		for bot in &self.bots {
-			println!("   🤖 {} -> {:?}", bot.name, bot.cards);
+			//println!("   🤖 {} -> {:?}", bot.name, bot.cards);
 
 			 println!("🤖 {}", bot.name);
-				println!("   Total Bluffs: {}", self.total_bluffs.get(&bot.name).unwrap_or(&0));
-				println!("   Caught Bluffs: {}", self.caught_bluffs.get(&bot.name).unwrap_or(&0));
-				println!("   Successful Bluffs: {}", self.successful_bluffs.get(&bot.name).unwrap_or(&0));
+				//println!("   Total Bluffs: {}", self.total_bluffs.get(&bot.name).unwrap_or(&0));
+				//println!("   Caught Bluffs: {}", self.caught_bluffs.get(&bot.name).unwrap_or(&0));
+				//println!("   Successful Bluffs: {}", self.successful_bluffs.get(&bot.name).unwrap_or(&0));
 		}
 		println!(); 
 
