@@ -22,5 +22,5 @@ fn main() {
     //coup_game.play();
 
     // Or play multiple games
-    coup_game.looping(10);
+    coup_game.looping(1000);
 }

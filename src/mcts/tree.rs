@@ -1,13 +1,9 @@
-//! Monte Carlo search utilities.
-//!
-//! This module implements a lightweight **Information-Set MCTS** style root search:
-//! - Each iteration samples a hidden state ("determinization") consistent with public info.
-//! - We select a root action using UCB1.
-//! - We run a playout from that action.
-//! - Root action statistics are aggregated across determinizations.
-//!
-//! Note: this is root-focused (not a full shared tree keyed by information sets),
-//! but it already removes the biggest determinization-leakage weakness.
+// This module implements a lightweight MCTS style root search:
+// - Each iteration samples a hidden state ("determinization") consistent with public info.
+// - Select a root action using UCB1
+// - Run a playout from that action
+// - Root action statistics are aggregated
+// Note: this is root-focused, so we only search at root level
 
 use rand::prelude::*;
 
@@ -16,16 +12,11 @@ use crate::Action;
 
 use super::sim_state::{PlayoutPolicy, SimState};
 
-/// Config for the MCTS root search.
 #[derive(Clone, Copy, Debug)]
 pub struct MctsConfig {
-    /// Total number of MCTS iterations (in addition to the 1-per-action warmup).
     pub iterations: usize,
-    /// Maximum playout depth (atomic transitions).
     pub max_depth: usize,
-    /// Exploration constant in UCB1.
     pub exploration_c: f32,
-    /// Risk penalty (mean - risk_lambda * stddev). Set to 0.0 for pure mean.
     pub risk_lambda: f32,
 }
 
@@ -73,7 +64,7 @@ impl RootStats {
     }
 }
 
-/// Information-set MCTS root searcher.
+// Information-set MCTS root searcher.
 pub struct Mcts {
     cfg: MctsConfig,
 }
@@ -83,22 +74,19 @@ impl Mcts {
         Self { cfg }
     }
 
-    /// Choose the best action for `context.name`.
+    // Choose the best action
     pub fn search<P: PlayoutPolicy>(&self, context: &Context, policy: &P) -> Option<Action> {
         let mut rng = thread_rng();
 
-        // Determine root legal actions (targets expanded) via a determinized state.
+        // Determine root legal actions in determinized state
         let root = SimState::from_context_determinized(context, policy, &mut rng);
         let actions = root.legal_root_actions();
         if actions.is_empty() {
             return None;
         }
 
-        // IMPORTANT: do NOT use HashMap<Action,...> (Action doesn't derive Hash in your project).
-        // Keep stats aligned with actions by index.
         let mut stats: Vec<RootStats> = vec![RootStats::default(); actions.len()];
 
-        // Warm up: evaluate each action once.
         for (i, a) in actions.iter().enumerate() {
             let mut s = SimState::from_context_determinized(context, policy, &mut rng);
             let w = s.playout_from_root_action(a, policy, &mut rng, self.cfg.max_depth);
@@ -106,7 +94,7 @@ impl Mcts {
         }
 
         for _ in 0..self.cfg.iterations {
-            // UCB1 over root actions.
+            // UCB1 over root actions
             let total_n = stats.iter().map(|s| s.n as f32).sum::<f32>().max(1.0);
 
             let mut pick_i: usize = 0;
@@ -130,13 +118,11 @@ impl Mcts {
 
             let pick_action = actions[pick_i].clone();
 
-            // Fresh determinization per iteration.
             let mut s = SimState::from_context_determinized(context, policy, &mut rng);
             let w = s.playout_from_root_action(&pick_action, policy, &mut rng, self.cfg.max_depth);
             stats[pick_i].add(w);
         }
 
-        // Risk-aware final selection: mean - lambda * stddev
         let mut best_action: Option<Action> = None;
         let mut best_score = f32::MIN;
 

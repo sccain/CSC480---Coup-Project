@@ -1,17 +1,15 @@
 // duel_brain.rs
-//! A lightweight belief + opponent modelling brain.
-//!
-//! This started life as a 1v1 "DuelBrain". For the MCTS bot we extend it to support
-//! multi-player, and to act as a **playout policy** for simulated challenge/counter
-//! rounds.
-//!
-//! What this brain provides:
-//! - Per-opponent claim counts (credibility model)
-//! - Simple challenge/counter decisions based on (a) deck scarcity, (b) credibility,
-//!   (c) stakes/tempo
-//! - A turn policy that chooses targets and actions in a multi-player setting
-//!
-//! It is intentionally cheap: in MCTS we call it *a lot*.
+// A lightweight belief + opponent modelling brain.
+
+// This started as a 1v1 "DuelBrain". For the MCTS bot we extend it to support
+// multi-player, and to act as a playout policy for simulated challenge/counter
+// rounds.
+
+// What this brain provides:
+// - Per-opponent claim counts (credibility model)
+// - Simple challenge/counter decisions based on (a) deck scarcity, (b) credibility,
+//   (c) stakes/tempo
+// - A turn policy that chooses targets and actions in a multi-player setting
 
 use std::collections::HashMap;
 
@@ -23,8 +21,8 @@ use crate::{
 use crate::mcts::sim_state::PlayoutPolicy;
 
 const N_CARDS: usize = 5;
-const RECENT_BLOCK_WINDOW: usize = 10;      // how far back (history entries) to look for "I got blocked"
-const SWAP_COOLDOWN_ACTIONS: usize = 8;      // how far back to prevent repeated Swapping
+const RECENT_BLOCK_WINDOW: usize = 10;      
+const SWAP_COOLDOWN_ACTIONS: usize = 8;
 
 fn card_idx(c: Card) -> usize {
     match c {
@@ -42,9 +40,7 @@ fn sigmoid(x: f64) -> f64 {
 
 #[derive(Clone, Default)]
 struct OppStats {
-    // Credibility model: how often we've seen them claim each role (action or counter).
     claims: [u32; N_CARDS],
-    // Behavioural model: how often they challenge.
     challenges: u32,
     opportunities_to_challenge: u32,
 }
@@ -66,10 +62,9 @@ impl DuelBrain {
         self.opp.clear();
     }
 
-    /// Update opponent models from the public game history.
+    // Update opponent models from the public game history
     pub fn update_from_history(&mut self, context: &Context) {
         if context.history.is_empty() {
-            // New game.
             self.reset();
             return;
         }
@@ -152,7 +147,7 @@ impl DuelBrain {
         num / den
     }
 
-    /// Baseline probability an opponent has `card`, based only on deck composition.
+    // Baseline probability an opponent has `card`, based only on deck composition.
     fn p_has_base(context: &Context, opp_cards: i32, card: Card) -> f64 {
         let n = Self::hidden_total(context);
         let k = Self::remaining_copies(context, card);
@@ -163,7 +158,7 @@ impl DuelBrain {
         1.0 - (Self::n_choose_k(n - k, h) / Self::n_choose_k(n, h))
     }
 
-    /// Belief that `opp_name` has `card`, with a credibility adjustment.
+    // Belief that `opp_name` has `card`, with a credibility adjustment.
     fn p_opponent_has(&self, context: &Context, opp_name: &str, opp_cards: i32, card: Card) -> f64 {
         let base = Self::p_has_base(context, opp_cards, card).clamp(0.0001, 0.9999);
 
@@ -180,7 +175,7 @@ impl DuelBrain {
         (odds / (1.0 + odds)).clamp(0.001, 0.999)
     }
 
-    /// Estimated probability `player_name` challenges a claim of `claimed_role` by someone else.
+    // Estimated probability `player_name` challenges a claim of `claimed_role` by someone else.
     fn p_player_challenges_claim(
         &self,
         context: &Context,
@@ -373,7 +368,7 @@ impl DuelBrain {
         ev > (0.85 + 0.30 * (stake - 1.0))
     }
 
-    /// Decide whether to counter/block an opponent action.
+    // Decide whether to counter/block an opponent action.
     pub fn decide_counter(&mut self, action: &Action, by: &str, context: &Context) -> bool {
         self.update_from_history(context);
         match action {
@@ -384,13 +379,13 @@ impl DuelBrain {
         }
     }
 
-    /// Decide whether to challenge an opponent's action claim.
+    // Decide whether to challenge an opponent's action claim.
     pub fn decide_challenge_action(&mut self, action: &Action, by: &str, context: &Context) -> bool {
         self.update_from_history(context);
         self.should_challenge_action_inner(context, action, by)
     }
 
-    /// Decide whether to challenge an opponent's counter claim.
+    // Decide whether to challenge an opponent's counter claim.
     pub fn decide_challenge_counter(&mut self, action: &Action, by: &str, context: &Context) -> bool {
         self.update_from_history(context);
         self.should_challenge_counter_inner(context, action, by)
@@ -405,13 +400,6 @@ impl DuelBrain {
 
         let start = h.len().saturating_sub(RECENT_BLOCK_WINDOW);
 
-        // Robust anti-loop heuristic:
-        // - The history may contain an *intervening challenge* entry between an
-        //   action declaration and the eventual counter.
-        // - Therefore we look for a matching action by us, then scan a few entries
-        //   ahead for a matching counter that targets us.
-        // - If we immediately counter-challenged, we do NOT treat it as a "blocked
-        //   loop" (even if the challenge fails).
         const LOOKAHEAD: usize = 4;
 
         for i in (start..h.len()).rev() {
@@ -525,7 +513,7 @@ impl DuelBrain {
             .any(|e| matches!(e, History::ActionSwapping { by } if by == me))
     }
 
-    /// Multi-player turn policy.
+    // Multi-player turn policy.
     pub fn decide_turn(&mut self, context: &Context) -> Action {
         self.update_from_history(context);
 
@@ -597,17 +585,10 @@ impl DuelBrain {
     }
 }
 
-// --- PlayoutPolicy implementation ---
-
 impl PlayoutPolicy for DuelBrain {
     fn decide_turn(&self, player: &str, ctx: &Context) -> Action {
-        // Playouts use a cloned brain per rollout in the simulator; but this method
-        // takes &self for speed. We therefore use a tiny "stateless" heuristic here.
-        //
-        // The MCTSBot passes a *mutable* brain to search; the simulator will call the
-        // mutable wrappers below when it wants update-from-history effects.
         if player == ctx.name {
-            // If we are called with ctx for the same player, fall back to a conservative policy.
+            // whoops...
         }
 
         // Simple heuristic: coup if possible, else tax, else income.
@@ -629,7 +610,6 @@ impl PlayoutPolicy for DuelBrain {
     }
 
     fn decide_counter(&self, _player: &str, action: &Action, by: &str, ctx: &Context) -> bool {
-        // Stateless conservative counter policy.
         match action {
             Action::Stealing(target) if target == &ctx.name => {
                 ctx.cards.contains(&Card::Captain) || ctx.cards.contains(&Card::Ambassador)

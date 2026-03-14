@@ -1,17 +1,4 @@
-//! A Coup simulation model used by the MCTS bot.
-//!
-//! Design goals:
-//! - Keep state transitions deterministic given a sampled hidden state.
-//! - Model the phases that matter in Coup: action -> (challenge?) -> (counter?) ->
-//!   (challenge counter?) -> resolution -> (choose loss).
-//! - Support multi-player targeting.
-//! - Allow Information-Set MCTS by sampling opponent hidden cards each iteration.
-//!
-//! Notes / limitations:
-//! - Tuned for decision making, not perfect rule coverage.
-//! - We model at most one challenger per claim (picked stochastically).
-//! - We now keep a lightweight public history stream during rollouts so playout
-//!   policies can condition on "what just happened".
+// simulation for rollout for MCTS bot
 
 use rand::prelude::*;
 use std::collections::HashSet;
@@ -19,34 +6,13 @@ use std::collections::HashSet;
 use crate::bot::{Context, OtherBot};
 use crate::{Action, Card, History};
 
-// --- Anti-loop heuristics ----------------------------------------------------
-//
-// In practice, bots can get stuck repeating an action that is consistently
-// countered (blocked), or spamming Ambassador (Swapping) even after being
-// challenged. The public history may include intervening challenge entries
-// between the action and the eventual counter, so naive adjacency checks
-// (Action immediately followed by Counter) can fail.
-//
-// We apply a small "cooldown" for recently failed actions at the simulator
-// level so that both the MCTS root action set and rollout move generation avoid
-// pathological loops.
+const RECENT_FAILURE_WINDOW: usize = 14;
+const POST_ACTION_LOOKAHEAD: usize = 4;
+const SWAP_COOLDOWN_ACTIONS: usize = 8;
 
-const RECENT_FAILURE_WINDOW: usize = 14; // how far back to search for a failed attempt
-const POST_ACTION_LOOKAHEAD: usize = 4; // how far forward to look for the action's resolution
-const SWAP_COOLDOWN_ACTIONS: usize = 8; // how far back to prevent repeated Swapping
-
-/// A policy hook used by the simulator during playouts.
-///
-/// The real game engine calls the bot for decisions during the actual game.
-/// Inside MCTS we need a model for how players react in challenge/counter phases.
 pub trait PlayoutPolicy {
-    /// Decide what action `player` takes on their turn in a simulated context.
     fn decide_turn(&self, player: &str, ctx: &Context) -> Action;
-
-    /// Decide whether `player` blocks/counters `action` declared by `by`.
     fn decide_counter(&self, player: &str, action: &Action, by: &str, ctx: &Context) -> bool;
-
-    /// Decide whether `player` challenges `action` declared by `by`.
     fn decide_challenge_action(
         &self,
         player: &str,
@@ -55,7 +21,6 @@ pub trait PlayoutPolicy {
         ctx: &Context,
     ) -> bool;
 
-    /// Decide whether `player` challenges the counter to `action`, made by `by`.
     fn decide_challenge_counter(
         &self,
         player: &str,
@@ -64,9 +29,6 @@ pub trait PlayoutPolicy {
         ctx: &Context,
     ) -> bool;
 
-    /// If `player` loses influence, choose which card to lose.
-    ///
-    /// Returning `None` means "lose a random influence".
     fn choose_influence_to_lose(&self, player: &str, ctx: &Context) -> Option<Card>;
 }
 
@@ -74,7 +36,6 @@ pub trait PlayoutPolicy {
 pub struct SimPlayer {
     pub name: String,
     pub coins: u8,
-    /// Hidden hand within a determinization.
     pub cards: Vec<Card>,
 }
 
@@ -84,37 +45,19 @@ pub struct SimState {
     pub players: Vec<SimPlayer>,
     pub to_move: usize,
 
-    /// Remaining deck in this determinization.
-    ///
-    /// Used for Exchange (Ambassador/Swapping) and for replacing a revealed card
-    /// after a truthful challenge/counter (real Coup rule).
     pub deck: Vec<Card>,
-
     pub discard_pile: Vec<Card>,
-
-    /// Public history stream.
-    ///
-    /// This starts as the real engine history at determinization time, and we
-    /// append simulated public events during the rollout. This is critical so
-    /// rollout policies (like DuelBrain) can avoid degenerate loops like
-    /// "keep trying to steal into a known blocker".
     pub history: Vec<History>,
-
-    /// Length of the engine's public history at the time of determinization.
     pub public_history_len: usize,
 
-    /// Penalize "wasted tempo" for the root player (e.g., actions getting
-    /// blocked and not challenged).
     root_tempo_waste: f32,
 
-    /// Penalty for entering a repeated public-ish state loop.
     loop_penalty: f32,
 }
 
 impl SimState {
-    /// Create a determinized simulation state by sampling opponents' hidden cards.
-    ///
-    /// This is called once per MCTS iteration.
+    //Create a determinized simulation state by sampling opponents' hidden cards.
+    // This is called once per MCTS iteration.
     pub fn from_context_determinized<P: PlayoutPolicy>(
         context: &Context,
         _policy: &P,
@@ -130,7 +73,7 @@ impl SimState {
             deck.push(Card::Contessa);
         }
 
-        // Remove known visible: our hand + discard pile.
+        // Remove cards not possible for the opponent to have
         let mut remove_one = |c: Card| {
             if let Some(i) = deck.iter().position(|x| *x == c) {
                 deck.swap_remove(i);
@@ -151,14 +94,13 @@ impl SimState {
             cards: context.cards.clone(),
         });
 
-        // Opponents: sample hidden cards consistent with their remaining influence count.
         for ob in &context.playing_bots {
             if ob.name == context.name {
                 continue;
             }
             let need = ob.cards as usize;
             let mut opp_cards = Vec::with_capacity(need);
-            for _ in 0..need {
+            for p in 0..need {
                 if deck.is_empty() {
                     break;
                 }
@@ -199,13 +141,12 @@ impl SimState {
             .map(|p| p.name.clone())
     }
 
-    /// Reward from the root player's perspective.
+    // Reward from the root
     pub fn reward_for_root(&self) -> f32 {
         if let Some(w) = self.winner_name() {
             return if w == self.root_name { 1.0 } else { 0.0 };
         }
 
-        // Non-terminal heuristic at depth cutoff.
         let root = self
             .players
             .iter()
@@ -231,7 +172,7 @@ impl SimState {
         let opp_tempo_threat = 0.04 * (opp_best_coin / 7.0);
         let rich_penalty = 0.02 * ((root_coin - 8.0).max(0.0) / 5.0);
 
-        // Penalize tempo waste (blocked actions that didn't resolve) and loops.
+        // Penalize wasted moves
         let tempo_penalty = 0.04 * self.root_tempo_waste;
         let loop_penalty = 0.15 * self.loop_penalty;
 
@@ -269,7 +210,7 @@ impl SimState {
         idx
     }
 
-    /// Public-ish context for the given player index.
+    // Context for the given player index.
     pub fn as_context_for_player(&self, player_idx: usize) -> Context {
         let me = &self.players[player_idx];
 
@@ -296,7 +237,7 @@ impl SimState {
         }
     }
 
-    /// Legal actions for the root player's on_turn. (Targets expanded.)
+    // Legal actions for the root player's on_turn
     pub fn legal_root_actions(&self) -> Vec<Action> {
         self.legal_actions_for(self.current_player_idx())
     }
@@ -307,7 +248,7 @@ impl SimState {
             return vec![];
         }
 
-        // Forced coup rule (common): only coups if >= 10.
+        // Forced coup rule: only coups if >= 10.
         if me.coins >= 10 {
             return self
                 .opponent_indices_of(player_idx)
@@ -317,7 +258,7 @@ impl SimState {
 
         let mut a = vec![Action::Income, Action::ForeignAid, Action::Tax, Action::Swapping];
 
-        // Targeted actions.
+        // Targeted actions
         for ti in self.opponent_indices_of(player_idx) {
             let t = self.players[ti].name.clone();
             a.push(Action::Stealing(t.clone()));
@@ -329,25 +270,17 @@ impl SimState {
             }
         }
 
-        // Filter out actions that are very likely to be an immediate tempo-wasting repeat.
-        // This is intentionally conservative: it only removes actions that the public
-        // history indicates were just tried and then blocked/challenged.
+        // Filter out actions that are very likely to be a waste of a move
         a.into_iter()
             .filter(|act| !self.action_is_on_cooldown(&me.name, act))
             .collect()
     }
 
-    /// Return true if the given `action` for `player_name` is on a short cooldown.
-    ///
-    /// The goal is to prevent "get blocked, repeat, get blocked" loops.
     fn action_is_on_cooldown(&self, player_name: &str, action: &Action) -> bool {
-        // Coup is always allowed (and already forced at >= 10 coins).
         if matches!(action, Action::Coup(_)) {
             return false;
         }
 
-        // Prevent repeated swapping regardless of outcome (it's a high-variance action
-        // in rollouts and is easy to spam).
         if matches!(action, Action::Swapping) {
             return self.recently_swapped(player_name);
         }
@@ -364,11 +297,6 @@ impl SimState {
             .any(|e| matches!(e, History::ActionSwapping { by } if by == player_name))
     }
 
-    /// True if `player_name` recently attempted the same `proposed` action and it
-    /// was countered (blocked) without the player even issuing a counter-challenge.
-    ///
-    /// We allow a few intervening entries between Action and Counter because the
-    /// action claim may have been challenged first.
     fn recently_blocked(&self, player_name: &str, proposed: &Action) -> bool {
         let h = &self.history;
         if h.len() < 2 {
@@ -423,7 +351,6 @@ impl SimState {
         false
     }
 
-    /// Run a complete playout from a chosen root action.
     pub fn playout_from_root_action<P: PlayoutPolicy>(
         &mut self,
         first_action: &Action,
@@ -483,7 +410,6 @@ impl SimState {
         v
     }
 
-    /// Apply a declared action, including challenge/counter phases, then advance turn.
     fn apply_declared_action<P: PlayoutPolicy>(
         &mut self,
         action: &Action,
@@ -499,16 +425,10 @@ impl SimState {
             return;
         }
 
-        // 0) Record action declaration in history.
         let actor_name = self.players[actor_idx].name.clone();
         self.push_action_history(&actor_name, action);
 
-        // 1) Challenge action (if challengeable)
-        // 2) Counter/block (if blockable)
-        // 3) Challenge counter (if countered)
-        // 4) Apply effect
 
-        // (1) Action challenge
         if let Some(required_role) = required_role_for_action(action) {
             if let Some(challenger_idx) =
                 self.pick_challenger_for_action(action, &actor_name, policy, rng)
@@ -531,7 +451,6 @@ impl SimState {
             }
         }
 
-        // (2) Counter/block
         let mut blocked_by: Option<usize> = None;
         if is_blockable(action) {
             // Foreign aid: anyone may block.
@@ -559,7 +478,6 @@ impl SimState {
             }
         }
 
-        // (3) Challenge counter
         if let Some(blocker_idx) = blocked_by {
             let blocker_name = self.players[blocker_idx].name.clone();
             let act_ctx = self.as_context_for_player(actor_idx);
@@ -607,7 +525,6 @@ impl SimState {
             }
         }
 
-        // (4) Apply effect
         self.apply_action_effect(action, policy, rng);
         self.to_move = self.next_alive_after(self.to_move);
     }
@@ -935,8 +852,6 @@ fn history_is_matching_action(h: &History, actor: &str, proposed: &Action) -> bo
     }
 }
 
-/// If `h` is a counter that blocks `proposed` (declared by `actor`), return the
-/// blocker's name.
 fn history_is_matching_counter(h: &History, actor: &str, proposed: &Action) -> Option<String> {
     match (proposed, h) {
         (Action::ForeignAid, History::CounterForeignAid { by, target }) if target == actor => {
