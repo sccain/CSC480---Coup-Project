@@ -19,8 +19,8 @@ fn main() {
     ]); 
 
     // Play a single game
-    //coup_game.play();
+    coup_game.play();
 
     // Or play multiple games
-    coup_game.looping(1000);
+    //coup_game.looping(1000);
 }
